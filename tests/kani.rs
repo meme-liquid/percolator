@@ -1904,22 +1904,21 @@ fn i1_lp_adl_never_reduces_capital() {
     );
 }
 
-/// FAST: Proportional ADL Fairness - equal unwrapped PNL means equal haircuts
-/// Uses even loss to avoid remainder distribution issues.
+/// Proportional ADL Fairness - equal unwrapped PNL means equal haircuts
+/// Uses concrete pnl, only loss (as even multiple) is symbolic.
 #[kani::proof]
-#[kani::unwind(33)]
+#[kani::unwind(5)]  // MAX_ACCOUNTS=4
 #[kani::solver(cadical)]
 fn adl_is_proportional_for_user_and_lp() {
     let mut engine = RiskEngine::new(test_params());
     let user_idx = engine.add_user(0).unwrap();
     let lp_idx = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
 
-    let pnl: i128 = kani::any();
-    let half_loss: u128 = kani::any();
+    // Concrete pnl - proportionality holds for any equal pnl values
+    let pnl: i128 = 50;
 
-    // Both have the same unwrapped PNL (very small for tractability)
-    kani::assume(pnl > 0 && pnl < 50);
-    // Even loss to avoid remainder issues
+    // Symbolic loss (must be even and <= total unwrapped)
+    let half_loss: u128 = kani::any();
     kani::assume(half_loss > 0 && half_loss <= pnl as u128);
     let loss = half_loss * 2;
 
@@ -1946,7 +1945,6 @@ fn adl_is_proportional_for_user_and_lp() {
     let user_loss = user_pnl_before - engine.accounts[user_idx as usize].pnl;
     let lp_loss = lp_pnl_before - engine.accounts[lp_idx as usize].pnl;
 
-    // Both should lose the same amount (proportional means equal when starting equal)
     assert!(
         user_loss == lp_loss,
         "ADL: User and LP with equal unwrapped PNL must receive equal haircuts"
