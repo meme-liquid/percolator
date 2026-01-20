@@ -1572,6 +1572,64 @@ impl RiskEngine {
         engine
     }
 
+    /// Kani-optimized constructor that skips freelist initialization.
+    ///
+    /// For Kani proofs that set up accounts via direct bitmap manipulation,
+    /// the freelist isn't needed. This avoids a 4096-iteration loop that
+    /// causes unwind assertion failures with small unwind bounds.
+    ///
+    /// SAFETY: Only use this in Kani proofs where you manually set up
+    /// the bitmap and don't call add_user/add_lp.
+    #[cfg(kani)]
+    pub fn new_minimal(params: RiskParams) -> Self {
+        // Same as new() but without the freelist loop
+        Self {
+            params,
+            max_crank_staleness_slots: params.max_crank_staleness_slots,
+            vault: U128::ZERO,
+            insurance_fund: InsuranceFund { balance: U128::ZERO, fee_revenue: U128::ZERO },
+            loss_accum: U128::ZERO,
+            current_slot: 0,
+            last_crank_slot: 0,
+            risk_reduction_only: false,
+            risk_reduction_mode_withdrawn: U128::ZERO,
+            warmup_paused: false,
+            warmup_pause_slot: 0,
+            funding_index_qpb_e6: I128::ZERO,
+            last_funding_slot: 0,
+            total_open_interest: U128::ZERO,
+            warmed_pos_total: U128::ZERO,
+            warmed_neg_total: U128::ZERO,
+            warmup_insurance_reserved: U128::ZERO,
+            adl_remainder_scratch: [U128::ZERO; MAX_ACCOUNTS],
+            adl_idx_scratch: [0; MAX_ACCOUNTS],
+            adl_exclude_scratch: [0; MAX_ACCOUNTS],
+            pending_profit_to_fund: U128::ZERO,
+            pending_unpaid_loss: U128::ZERO,
+            pending_epoch: 0,
+            pending_exclude_epoch: [0; MAX_ACCOUNTS],
+            liq_cursor: 0,
+            gc_cursor: 0,
+            last_full_sweep_start_slot: 0,
+            last_full_sweep_completed_slot: 0,
+            crank_cursor: 0,
+            sweep_start_idx: 0,
+            lifetime_liquidations: 0,
+            lifetime_force_realize_closes: 0,
+            net_lp_pos: I128::ZERO,
+            lp_sum_abs: U128::ZERO,
+            lp_max_abs: U128::ZERO,
+            lp_max_abs_sweep: U128::ZERO,
+            used: [0; BITMAP_WORDS],
+            num_used_accounts: 0,
+            next_account_id: 0,
+            free_head: u16::MAX, // Empty freelist - caller sets up bitmap directly
+            _padding_accounts: [0; 8],
+            next_free: [0; MAX_ACCOUNTS], // Uninitialized - not used with direct bitmap
+            accounts: [empty_account(); MAX_ACCOUNTS],
+        }
+    }
+
     /// Initialize a RiskEngine in place (zero-copy friendly).
     ///
     /// PREREQUISITE: The memory backing `self` MUST be zeroed before calling.
