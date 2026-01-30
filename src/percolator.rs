@@ -2061,18 +2061,9 @@ impl RiskEngine {
         // Update last_fee_slot
         account.last_fee_slot = now_slot;
 
-        // Book revenue from positive fee_credits that will be consumed
-        let credits_before = core::cmp::max(account.fee_credits.get(), 0) as u128;
-        let pay_from_credits = core::cmp::min(credits_before, due);
-
-        // Deduct from fee_credits
+        // Deduct from fee_credits (coupon: no insurance booking here —
+        // insurance was already paid when credits were granted)
         account.fee_credits = account.fee_credits.saturating_sub(due as i128);
-
-        // Prepaid credits being spent → book as insurance revenue now
-        if pay_from_credits > 0 {
-            self.insurance_fund.balance = self.insurance_fund.balance + pay_from_credits;
-            self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay_from_credits;
-        }
 
         // If fee_credits is negative, pay from capital
         if account.fee_credits.is_negative() {
@@ -2129,18 +2120,9 @@ impl RiskEngine {
         // Advance slot marker regardless
         account.last_fee_slot = now_slot;
 
-        // Book revenue from positive fee_credits that will be consumed
-        let credits_before = core::cmp::max(account.fee_credits.get(), 0) as u128;
-        let pay_from_credits = core::cmp::min(credits_before, due);
-
-        // Deduct from fee_credits first
+        // Deduct from fee_credits (coupon: no insurance booking here —
+        // insurance was already paid when credits were granted)
         account.fee_credits = account.fee_credits.saturating_sub(due as i128);
-
-        // Prepaid credits being spent → book as insurance revenue now
-        if pay_from_credits > 0 {
-            self.insurance_fund.balance = self.insurance_fund.balance + pay_from_credits;
-            self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay_from_credits;
-        }
 
         // If negative, pay what we can from capital (no margin check)
         if account.fee_credits.is_negative() {
@@ -2200,11 +2182,13 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// Deposit prepaid fee credits for an account.
+    /// Pre-fund fee credits for an account.
     ///
     /// The wrapper must have already transferred `amount` tokens into the vault.
-    /// This records the prepaid fees: vault increases, insurance receives the
-    /// prepaid amount, and the account's fee_credits balance increases.
+    /// This pre-pays future maintenance fees: vault increases, insurance receives
+    /// the amount as revenue (since credits are a coupon — spending them later
+    /// does NOT re-book into insurance), and the account's fee_credits balance
+    /// increases by `amount`.
     pub fn deposit_fee_credits(&mut self, idx: u16, amount: u128, now_slot: u64) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
@@ -2214,7 +2198,9 @@ impl RiskEngine {
         // Wrapper transferred tokens into vault
         self.vault = self.vault + amount;
 
-        // Prepaid fees belong to insurance immediately
+        // Pre-fund: insurance receives the amount now.
+        // When credits are later spent during fee settlement, no further
+        // insurance booking occurs (coupon semantics).
         self.insurance_fund.balance = self.insurance_fund.balance + amount;
         self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + amount;
 
@@ -4341,17 +4327,9 @@ impl RiskEngine {
                 .saturating_mul(dt as u128);
             account.last_fee_slot = now_slot;
 
-            // Book revenue from positive fee_credits that will be consumed
-            let credits_before = core::cmp::max(account.fee_credits.get(), 0) as u128;
-            let pay_from_credits = core::cmp::min(credits_before, due);
-
+            // Deduct from fee_credits (coupon: no insurance booking here —
+            // insurance was already paid when credits were granted)
             account.fee_credits = account.fee_credits.saturating_sub(due as i128);
-
-            // Prepaid credits being spent → book as insurance revenue now
-            if pay_from_credits > 0 {
-                self.insurance_fund.balance = self.insurance_fund.balance + pay_from_credits;
-                self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay_from_credits;
-            }
         }
 
         // Pay any owed fees from deposit first
@@ -6402,7 +6380,7 @@ mod tests {
         let bal_before = engine.insurance_fund.balance.get();
 
         // Settle maintenance: dt=5, fee_per_slot=10, due=50
-        // All 50 should come from fee_credits
+        // All 50 should come from fee_credits (coupon: no insurance booking)
         engine
             .settle_maintenance_fee(user_idx, 6, ORACLE_100K)
             .unwrap();
@@ -6412,15 +6390,17 @@ mod tests {
             50,
             "fee_credits should decrease by 50"
         );
+        // Coupon semantics: spending credits does NOT touch insurance.
+        // Insurance was already paid when credits were granted.
         assert_eq!(
             engine.insurance_fund.fee_revenue.get() - rev_before,
-            50,
-            "insurance fee_revenue must increase by 50"
+            0,
+            "insurance fee_revenue must NOT change (coupon semantics)"
         );
         assert_eq!(
             engine.insurance_fund.balance.get() - bal_before,
-            50,
-            "insurance balance must increase by 50"
+            0,
+            "insurance balance must NOT change (coupon semantics)"
         );
     }
 
@@ -6450,7 +6430,7 @@ mod tests {
         let rev_increase = engine.insurance_fund.fee_revenue.get() - rev_before;
         let cap_after = engine.accounts[user_idx as usize].capital.get();
 
-        assert_eq!(rev_increase, 70, "insurance revenue should be 30 (credits) + 40 (capital)");
+        assert_eq!(rev_increase, 40, "insurance revenue should be 40 (capital only; credits are coupon)");
         assert_eq!(cap_after, 0, "capital should be fully drained");
         // fee_credits should be -30 (100 due - 30 credits - 40 capital = 30 unpaid debt)
         assert_eq!(
