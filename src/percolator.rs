@@ -564,6 +564,8 @@ pub struct CrankOutcome {
     pub last_cursor: u16,
     /// Whether this crank completed a full sweep of all accounts
     pub sweep_complete: bool,
+    /// Amount of PnL haircut by stranded funds recovery (0 if no recovery needed)
+    pub stranded_recovery: u128,
 }
 
 // ============================================================================
@@ -1762,6 +1764,18 @@ impl RiskEngine {
         // Garbage collect dust accounts
         let num_gc_closed = self.garbage_collect_dust();
 
+        // Recover stranded funds after socialized loss event.
+        // Conditions: risk_reduction_only + loss_accum > 0 + OI == 0 + no pending.
+        // This haircuts phantom PnL and tops up insurance so LPs can exit.
+        let stranded_recovery = if self.risk_reduction_only
+            && !self.loss_accum.is_zero()
+            && self.total_open_interest.is_zero()
+        {
+            self.recover_stranded_to_insurance().unwrap_or(0)
+        } else {
+            0
+        };
+
         // Detect conditions for informational flags
         let force_realize_needed = self.force_realize_active();
         let panic_needed = !force_realize_needed
@@ -1782,6 +1796,7 @@ impl RiskEngine {
             force_realize_errors,
             last_cursor: self.crank_cursor,
             sweep_complete,
+            stranded_recovery,
         })
     }
 
@@ -4733,6 +4748,268 @@ impl RiskEngine {
                 Ok(false)
             }
         }
+    }
+
+    // ========================================
+    // Stranded Funds Detection & Recovery
+    // ========================================
+
+    /// Compute stranded vault funds: tokens in the vault beyond immediate claims.
+    ///
+    /// Returns the amount of vault tokens that are currently inaccessible.
+    /// In normal operation this is zero or near-zero. After a socialized loss event
+    /// with risk-reduction mode active, this can be a large fraction of the vault.
+    ///
+    /// stranded = vault - sum(capital) - insurance_fund.balance
+    ///
+    /// Of the stranded amount, `loss_accum` lamports are permanently phantom
+    /// (accounting holes from unrecoverable losses). The remainder is positive PnL
+    /// that is frozen by the warmup pause.
+    pub fn stranded_funds(&self) -> u128 {
+        let mut total_capital = 0u128;
+        self.for_each_used(|_idx, account| {
+            total_capital = total_capital.saturating_add(account.capital.get());
+        });
+        self.vault
+            .get()
+            .saturating_sub(total_capital)
+            .saturating_sub(self.insurance_fund.balance.get())
+    }
+
+    /// Recover stranded vault funds after a socialized loss event.
+    ///
+    /// When `loss_accum > 0` and all positions are closed, the vault contains
+    /// funds that are stuck: the LP earned PnL but cannot withdraw because
+    /// warmup is frozen and insurance is depleted. This creates a deadlock:
+    ///
+    ///   no trades → no fees → no insurance growth → no warmup budget → LP stuck
+    ///
+    /// This function breaks the deadlock by haircutting positive PnL to cover:
+    /// 1. `loss_accum` — phantom PnL backed by accounting holes, not real tokens
+    /// 2. Insurance deficit — to bring insurance back to threshold, enabling mode exit
+    ///
+    /// The haircut is fair because:
+    /// - `loss_accum` represents unrecoverable losses; the PnL it "backs" is phantom
+    /// - The insurance top-up enables the LP to actually withdraw remaining real PnL
+    /// - Conservation invariant is preserved (both sides decrease by the same amount)
+    ///
+    /// After recovery, warmup slopes are reset for affected accounts and the
+    /// function attempts to exit risk-reduction-only mode.
+    ///
+    /// Prerequisites:
+    /// - `risk_reduction_only == true`
+    /// - `loss_accum > 0`
+    /// - `total_open_interest == 0` (all positions closed)
+    /// - No pending socialization
+    ///
+    /// Returns the total amount of PnL haircut.
+    pub fn recover_stranded_to_insurance(&mut self) -> Result<u128> {
+        // Gate: must be in risk-reduction mode
+        if !self.risk_reduction_only {
+            return Ok(0);
+        }
+
+        // Gate: must have loss_accum > 0 (otherwise no stranded funds)
+        if self.loss_accum.is_zero() {
+            return Ok(0);
+        }
+
+        // Gate: all positions must be closed (no mark PnL uncertainty)
+        if !self.total_open_interest.is_zero() {
+            return Ok(0);
+        }
+
+        // Gate: no pending socialization in flight
+        self.require_no_pending_socialization()?;
+
+        // This is a risk-reducing operation
+        self.enforce_op(OpClass::RiskReduce)?;
+
+        // Pass 1: Compute total positive PnL across all accounts
+        let mut total_positive_pnl = 0u128;
+        for block in 0..BITMAP_WORDS {
+            let mut w = self.used[block];
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let idx = block * 64 + bit;
+                w &= w - 1;
+                if idx >= MAX_ACCOUNTS {
+                    continue;
+                }
+                if self.accounts[idx].pnl.is_positive() {
+                    total_positive_pnl =
+                        total_positive_pnl.saturating_add(self.accounts[idx].pnl.get() as u128);
+                }
+            }
+        }
+
+        if total_positive_pnl == 0 {
+            return Ok(0); // Nothing to haircut
+        }
+
+        // Compute needed haircut:
+        //   1. Cover loss_accum (phantom PnL → accounting correction)
+        //   2. Top up insurance to threshold (enables risk-reduction exit)
+        let loss_coverage_needed = self.loss_accum.get();
+        let insurance_deficit = self
+            .params
+            .risk_reduction_threshold
+            .get()
+            .saturating_sub(self.insurance_fund.balance.get());
+        let total_needed = loss_coverage_needed.saturating_add(insurance_deficit);
+
+        let haircut = core::cmp::min(total_needed, total_positive_pnl);
+
+        if haircut == 0 {
+            return Ok(0);
+        }
+
+        // Pass 2: Apply proportional haircut using largest-remainder method
+        let mut applied = 0u128;
+        let mut m: usize = 0;
+
+        for block in 0..BITMAP_WORDS {
+            let mut w = self.used[block];
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let idx = block * 64 + bit;
+                w &= w - 1;
+                if idx >= MAX_ACCOUNTS {
+                    continue;
+                }
+
+                if !self.accounts[idx].pnl.is_positive() {
+                    continue;
+                }
+
+                let acct_pnl = self.accounts[idx].pnl.get() as u128;
+
+                let numer = haircut
+                    .checked_mul(acct_pnl)
+                    .ok_or(RiskError::Overflow)?;
+                let floor_haircut = numer / total_positive_pnl;
+                let rem = numer % total_positive_pnl;
+
+                self.accounts[idx].pnl =
+                    self.accounts[idx].pnl.saturating_sub(floor_haircut as i128);
+                applied += floor_haircut;
+
+                // Clamp reserved_pnl to not exceed new positive PnL
+                let new_pnl = self.accounts[idx].pnl.get();
+                if new_pnl >= 0 {
+                    let max_reserved = new_pnl as u64;
+                    if self.accounts[idx].reserved_pnl > max_reserved {
+                        self.accounts[idx].reserved_pnl = max_reserved;
+                    }
+                } else {
+                    self.accounts[idx].reserved_pnl = 0;
+                }
+
+                if rem != 0 {
+                    self.adl_remainder_scratch[idx] = U128::new(rem);
+                    self.adl_idx_scratch[m] = idx as u16;
+                    m += 1;
+                }
+            }
+        }
+
+        // Distribute leftover using largest-remainder (same algo as ADL)
+        let leftover = haircut - applied;
+        if leftover > 0 && m > 0 {
+            self.adl_build_heap(m);
+            let mut heap_size = m;
+            let take = core::cmp::min(leftover as usize, m);
+            for _ in 0..take {
+                let idx = self.adl_pop_max(&mut heap_size) as usize;
+                self.accounts[idx].pnl = self.accounts[idx].pnl.saturating_sub(1);
+
+                let new_pnl = self.accounts[idx].pnl.get();
+                if new_pnl >= 0 {
+                    let max_reserved = new_pnl as u64;
+                    if self.accounts[idx].reserved_pnl > max_reserved {
+                        self.accounts[idx].reserved_pnl = max_reserved;
+                    }
+                } else {
+                    self.accounts[idx].reserved_pnl = 0;
+                }
+            }
+            applied += take as u128;
+        }
+
+        #[cfg(any(test, kani))]
+        debug_assert!(
+            applied == haircut,
+            "Stranded recovery rounding bug: applied {} != haircut {}",
+            applied,
+            haircut
+        );
+
+        // Distribute the haircut value: first to loss_accum, then to insurance.
+        //
+        // Conservation proof:
+        //   Before: vault + L = C + P + I + slack
+        //   After:  vault + (L - R) = C + (P - H) + (I + T) + slack
+        //   where H = applied, R = loss_reduction, T = insurance_topup = H - R
+        //   Expanding RHS: C + P - H + I + H - R = C + P + I - R
+        //   LHS: vault + L - R
+        //   Both sides decrease by R from the original equation. QED.
+        let loss_reduction = core::cmp::min(applied, self.loss_accum.get());
+        self.loss_accum = U128::new(self.loss_accum.get().saturating_sub(loss_reduction));
+
+        let insurance_topup = applied.saturating_sub(loss_reduction);
+        if insurance_topup > 0 {
+            self.insurance_fund.balance =
+                U128::new(self.insurance_fund.balance.get().saturating_add(insurance_topup));
+        }
+
+        // Reset warmup for all accounts with remaining positive PnL.
+        // The warmup period restarts for the new (haircut) PnL amount.
+        for block in 0..BITMAP_WORDS {
+            let mut w = self.used[block];
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let idx = block * 64 + bit;
+                w &= w - 1;
+                if idx >= MAX_ACCOUNTS {
+                    continue;
+                }
+
+                if self.accounts[idx].pnl.is_positive() {
+                    let pnl = self.accounts[idx].pnl.get() as u128;
+                    let slope = if self.params.warmup_period_slots > 0 {
+                        let base = pnl / (self.params.warmup_period_slots as u128);
+                        core::cmp::max(1, base)
+                    } else {
+                        pnl // Instant warmup if period is 0
+                    };
+                    self.accounts[idx].warmup_slope_per_step = U128::new(slope);
+                    self.accounts[idx].warmup_started_at_slot = self.current_slot;
+                }
+            }
+        }
+
+        // Recompute warmup insurance reserved
+        self.recompute_warmup_insurance_reserved();
+
+        // Try to exit risk-reduction mode
+        self.exit_risk_reduction_only_mode_if_safe();
+
+        // Assert reserved equality invariant in test/kani
+        #[cfg(any(test, kani))]
+        {
+            let raw = self.insurance_spendable_raw();
+            let needed = self
+                .warmed_pos_total
+                .get()
+                .saturating_sub(self.warmed_neg_total.get());
+            let expect_reserved = core::cmp::min(needed, raw);
+            debug_assert!(
+                self.warmup_insurance_reserved.get() == expect_reserved,
+                "Reserved invariant violated in recover_stranded_to_insurance"
+            );
+        }
+
+        Ok(applied)
     }
 
     // ========================================
