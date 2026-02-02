@@ -343,6 +343,11 @@ fn inv_per_account(engine: &RiskEngine) -> bool {
             let idx = block * 64 + bit;
             w &= w - 1;
 
+            // Guard: reject states with bitmap bits beyond MAX_ACCOUNTS
+            if idx >= MAX_ACCOUNTS {
+                return false;
+            }
+
             let account = &engine.accounts[idx];
 
             // PA1: reserved_pnl <= max(pnl, 0)
@@ -405,10 +410,20 @@ fn canonical_inv(engine: &RiskEngine) -> bool {
         && inv_per_account(engine)
 }
 
-// Use engine.recompute_aggregates() after manually setting account.capital or
-// account.pnl in test setup. This ensures c_tot and pnl_pos_tot are consistent.
-// NOTE: recompute_aggregates does NOT recompute total_open_interest.
-// If you manually set position_size, you must also set total_open_interest.
+/// Sync all engine aggregates (c_tot, pnl_pos_tot, total_open_interest) from account data.
+/// Call this after manually setting account.capital, account.pnl, or account.position_size.
+/// Unlike engine.recompute_aggregates() which only handles c_tot and pnl_pos_tot,
+/// this also recomputes total_open_interest.
+fn sync_engine_aggregates(engine: &mut RiskEngine) {
+    engine.recompute_aggregates();
+    let mut oi: u128 = 0;
+    for idx in 0..MAX_ACCOUNTS {
+        if engine.is_used(idx) {
+            oi = oi.saturating_add(abs_i128_to_u128(engine.accounts[idx].position_size.get()));
+        }
+    }
+    engine.total_open_interest = U128::new(oi);
+}
 
 // ============================================================================
 // NON-VACUITY ASSERTION HELPERS
@@ -980,26 +995,24 @@ fn funding_p1_settlement_idempotent() {
     kani::assume(index.abs() < 1_000_000_000);
     engine.funding_index_qpb_e6 = I128::new(index);
 
-    // Settle once
-    if engine.touch_account(user_idx).is_ok() {
-        let pnl_after_first = engine.accounts[user_idx as usize].pnl;
-        let snapshot_after_first = engine.accounts[user_idx as usize].funding_index;
+    // Settle once (must succeed under bounded inputs)
+    engine.touch_account(user_idx).unwrap();
+    let pnl_after_first = engine.accounts[user_idx as usize].pnl;
 
-        // Settle again without changing global index
-        if engine.touch_account(user_idx).is_ok() {
-            // PNL should be unchanged
-            assert!(
-                engine.accounts[user_idx as usize].pnl.get() == pnl_after_first.get(),
-                "Second settlement should not change PNL"
-            );
+    // Settle again without changing global index
+    engine.touch_account(user_idx).unwrap();
 
-            // Snapshot should equal global index
-            assert!(
-                engine.accounts[user_idx as usize].funding_index == engine.funding_index_qpb_e6,
-                "Snapshot should equal global index"
-            );
-        }
-    }
+    // PNL should be unchanged (idempotent)
+    assert!(
+        engine.accounts[user_idx as usize].pnl.get() == pnl_after_first.get(),
+        "Second settlement should not change PNL"
+    );
+
+    // Snapshot should equal global index
+    assert!(
+        engine.accounts[user_idx as usize].funding_index == engine.funding_index_qpb_e6,
+        "Snapshot should equal global index"
+    );
 }
 
 #[kani::proof]
@@ -1027,14 +1040,14 @@ fn funding_p2_never_touches_principal() {
     kani::assume(funding_delta.abs() < 1_000_000_000);
     engine.funding_index_qpb_e6 = I128::new(funding_delta);
 
-    // Settle funding
-    if engine.touch_account(user_idx).is_ok() {
-        // Principal must be unchanged
-        assert!(
-            engine.accounts[user_idx as usize].capital.get() == principal,
-            "Funding must never modify principal"
-        );
-    }
+    // Settle funding (must succeed under bounded inputs)
+    engine.touch_account(user_idx).unwrap();
+
+    // Principal must be unchanged
+    assert!(
+        engine.accounts[user_idx as usize].capital.get() == principal,
+        "Funding must never modify principal"
+    );
 }
 
 #[kani::proof]
@@ -1111,32 +1124,28 @@ fn funding_p4_settle_before_position_change() {
     kani::assume(delta1.abs() < 1_000);
     engine.funding_index_qpb_e6 = I128::new(delta1);
 
-    // Settle BEFORE changing position (correct way)
-    if engine.touch_account(user_idx).is_ok() {
-        let pnl_after_period1 = engine.accounts[user_idx as usize].pnl;
+    // Settle BEFORE changing position (must succeed under bounded inputs)
+    engine.touch_account(user_idx).unwrap();
+    let pnl_after_period1 = engine.accounts[user_idx as usize].pnl;
 
-        // Change position
-        let new_pos: i128 = kani::any();
-        kani::assume(new_pos > 0 && new_pos < 10_000 && new_pos != initial_pos);
-        engine.accounts[user_idx as usize].position_size = I128::new(new_pos);
+    // Change position
+    let new_pos: i128 = kani::any();
+    kani::assume(new_pos > 0 && new_pos < 10_000 && new_pos != initial_pos);
+    engine.accounts[user_idx as usize].position_size = I128::new(new_pos);
 
-        // Period 2: more funding
-        let delta2: i128 = kani::any();
-        kani::assume(delta2 != i128::MIN);
-        kani::assume(delta2.abs() < 1_000);
-        engine.funding_index_qpb_e6 = I128::new(delta1 + delta2);
+    // Period 2: more funding
+    let delta2: i128 = kani::any();
+    kani::assume(delta2 != i128::MIN);
+    kani::assume(delta2.abs() < 1_000);
+    engine.funding_index_qpb_e6 = I128::new(delta1 + delta2);
 
-        if engine.touch_account(user_idx).is_ok() {
-            // The settlement should have correctly applied:
-            // - delta1 to initial_pos
-            // - delta2 to new_pos
-            // Snapshot should equal global index
-            assert!(
-                engine.accounts[user_idx as usize].funding_index == engine.funding_index_qpb_e6,
-                "Snapshot must track global index"
-            );
-        }
-    }
+    engine.touch_account(user_idx).unwrap();
+
+    // Snapshot should equal global index after settlement
+    assert!(
+        engine.accounts[user_idx as usize].funding_index == engine.funding_index_qpb_e6,
+        "Snapshot must track global index"
+    );
 }
 
 #[kani::proof]
@@ -1194,13 +1203,14 @@ fn funding_zero_position_no_change() {
     kani::assume(delta.abs() < 1_000_000_000);
     engine.funding_index_qpb_e6 = I128::new(delta);
 
-    if engine.touch_account(user_idx).is_ok() {
-        // PNL should be unchanged
-        assert!(
-            engine.accounts[user_idx as usize].pnl.get() == pnl_before,
-            "Zero position should not pay or receive funding"
-        );
-    }
+    // Must succeed (zero position skips funding calc, only checked_sub on indices)
+    engine.touch_account(user_idx).unwrap();
+
+    // PNL should be unchanged
+    assert!(
+        engine.accounts[user_idx as usize].pnl.get() == pnl_before,
+        "Zero position should not pay or receive funding"
+    );
 }
 
 // ============================================================================
@@ -1243,6 +1253,7 @@ fn panic_settle_closes_all_positions() {
     engine.funding_index_qpb_e6 = I128::new(0); // No funding complexity
     engine.vault = U128::new(20_000);
     engine.insurance_fund.balance = U128::new(10_000);
+    sync_engine_aggregates(&mut engine);
 
     // Call panic_settle_all
     let result = engine.panic_settle_all(oracle_price);
@@ -1293,6 +1304,7 @@ fn panic_settle_clamps_negative_pnl() {
 
     engine.vault = U128::new(1_000);
     engine.insurance_fund.balance = U128::new(500);
+    sync_engine_aggregates(&mut engine);
 
     let result = engine.panic_settle_all(oracle_price);
 
@@ -1349,10 +1361,11 @@ fn panic_settle_preserves_conservation() {
     engine.accounts[lp_idx as usize].entry_price = price;
     engine.accounts[lp_idx as usize].capital = U128::new(lp_capital);
 
-    // Set vault to match total capital
+    // Set vault to match total capital, sync aggregates
     let total_capital = user_capital + lp_capital;
     engine.vault = U128::new(total_capital);
     engine.insurance_fund.balance = U128::new(0);
+    sync_engine_aggregates(&mut engine);
 
     // Call panic_settle_all
     let result = engine.panic_settle_all(price);
@@ -1363,28 +1376,11 @@ fn panic_settle_preserves_conservation() {
         "PS4: panic_settle_all must succeed under bounded inputs"
     );
 
-    // PROOF: Conservation via "expected vs actual" (no check_conservation() call)
-    // Compute expected value
-    let post_total_capital = engine.accounts[user_idx as usize].capital.get()
-        + engine.accounts[lp_idx as usize].capital.get();
-    let user_pnl = engine.accounts[user_idx as usize].pnl.get();
-    let lp_pnl = engine.accounts[lp_idx as usize].pnl.get();
-    let net_pnl = user_pnl.saturating_add(lp_pnl);
-
-    let base = post_total_capital + engine.insurance_fund.balance.get();
-    let expected = if net_pnl >= 0 {
-        base + (net_pnl as u128)
-    } else {
-        base.saturating_sub(neg_i128_to_u128(net_pnl))
-    };
-
-    // Primary conservation: vault >= c_tot + insurance
+    // Primary conservation: vault >= c_tot + insurance (exact, no slack needed)
     let actual = engine.vault.get();
     let expected_primary = engine.c_tot.get() + engine.insurance_fund.balance.get();
-
-    // PS4a: No under-collateralization
     assert!(
-        actual >= expected_primary.saturating_sub(MAX_ROUNDING_SLACK),
+        actual >= expected_primary,
         "PS4: Vault under-collateralized after panic_settle"
     );
 }
@@ -1469,6 +1465,7 @@ fn proof_c1_conservation_bounded_slack_panic_settle() {
     engine.accounts[user2 as usize].entry_price = entry_price;
 
     engine.vault = U128::new(capital * 2);
+    sync_engine_aggregates(&mut engine);
 
     let res = engine.panic_settle_all(oracle_price);
     assert!(
@@ -1476,25 +1473,11 @@ fn proof_c1_conservation_bounded_slack_panic_settle() {
         "C1: panic_settle_all must succeed under bounded inputs"
     );
 
-    let total_capital = engine.accounts[user1 as usize].capital.get()
-        + engine.accounts[user2 as usize].capital.get();
-    let pnl1 = engine.accounts[user1 as usize].pnl.get();
-    let pnl2 = engine.accounts[user2 as usize].pnl.get();
-    let net_pnl = pnl1.saturating_add(pnl2);
-
-    let base = total_capital + engine.insurance_fund.balance.get();
-    let expected = if net_pnl >= 0 {
-        base + (net_pnl as u128)
-    } else {
-        base.saturating_sub(neg_i128_to_u128(net_pnl))
-    };
-
-    // Primary conservation: vault >= c_tot + insurance
+    // Primary conservation: vault >= c_tot + insurance (exact, no slack needed)
     let actual = engine.vault.get();
     let expected_primary = engine.c_tot.get() + engine.insurance_fund.balance.get();
-
     assert!(
-        actual >= expected_primary.saturating_sub(MAX_ROUNDING_SLACK),
+        actual >= expected_primary,
         "AUDIT PROOF FAILED: Vault under-collateralized after panic_settle"
     );
 
@@ -1538,31 +1521,18 @@ fn proof_c1_conservation_bounded_slack_force_realize() {
 
     engine.insurance_fund.balance = U128::new(floor);
     engine.vault = U128::new(capital * 2 + floor);
+    sync_engine_aggregates(&mut engine);
 
     let result = engine.force_realize_losses(oracle_price);
 
     // Non-vacuity: force_realize must succeed
     assert!(result.is_ok(), "non-vacuity: force_realize_losses must succeed");
 
-    let total_capital = engine.accounts[user1 as usize].capital.get()
-        + engine.accounts[user2 as usize].capital.get();
-    let pnl1 = engine.accounts[user1 as usize].pnl.get();
-    let pnl2 = engine.accounts[user2 as usize].pnl.get();
-    let net_pnl = pnl1.saturating_add(pnl2);
-
-    let base = total_capital + engine.insurance_fund.balance.get();
-    let expected = if net_pnl >= 0 {
-        base + (net_pnl as u128)
-    } else {
-        base.saturating_sub(neg_i128_to_u128(net_pnl))
-    };
-
-    // Primary conservation: vault >= c_tot + insurance
+    // Primary conservation: vault >= c_tot + insurance (exact, no slack needed)
     let actual = engine.vault.get();
     let expected_primary = engine.c_tot.get() + engine.insurance_fund.balance.get();
-
     assert!(
-        actual >= expected_primary.saturating_sub(MAX_ROUNDING_SLACK),
+        actual >= expected_primary,
         "C1b FAILED: Vault under-collateralized after force_realize"
     );
 }
@@ -1714,40 +1684,39 @@ fn fast_frame_touch_account_only_mutates_one_account() {
     let user_capital_before = engine.accounts[user_idx as usize].capital;
     let globals_before = snapshot_globals(&engine);
 
-    // Touch account — guard Ok path
-    let result = engine.touch_account(user_idx);
-    if result.is_ok() {
-        // Assert: other account unchanged
-        let other_after = &engine.accounts[other_idx as usize];
-        assert!(
-            other_after.capital.get() == other_snapshot.capital,
-            "Frame: other capital unchanged"
-        );
-        assert!(
-            other_after.pnl.get() == other_snapshot.pnl,
-            "Frame: other pnl unchanged"
-        );
-        assert!(
-            other_after.position_size.get() == other_snapshot.position_size,
-            "Frame: other position unchanged"
-        );
+    // Touch account (must succeed under bounded inputs)
+    engine.touch_account(user_idx).unwrap();
 
-        // Assert: user capital unchanged (only pnl and funding_index can change)
-        assert!(
-            engine.accounts[user_idx as usize].capital.get() == user_capital_before.get(),
-            "Frame: capital unchanged"
-        );
+    // Assert: other account unchanged
+    let other_after = &engine.accounts[other_idx as usize];
+    assert!(
+        other_after.capital.get() == other_snapshot.capital,
+        "Frame: other capital unchanged"
+    );
+    assert!(
+        other_after.pnl.get() == other_snapshot.pnl,
+        "Frame: other pnl unchanged"
+    );
+    assert!(
+        other_after.position_size.get() == other_snapshot.position_size,
+        "Frame: other position unchanged"
+    );
 
-        // Assert: globals unchanged
-        assert!(
-            engine.vault.get() == globals_before.vault,
-            "Frame: vault unchanged"
-        );
-        assert!(
-            engine.insurance_fund.balance.get() == globals_before.insurance_balance,
-            "Frame: insurance unchanged"
-        );
-    }
+    // Assert: user capital unchanged (only pnl and funding_index can change)
+    assert!(
+        engine.accounts[user_idx as usize].capital.get() == user_capital_before.get(),
+        "Frame: capital unchanged"
+    );
+
+    // Assert: globals unchanged
+    assert!(
+        engine.vault.get() == globals_before.vault,
+        "Frame: vault unchanged"
+    );
+    assert!(
+        engine.insurance_fund.balance.get() == globals_before.insurance_balance,
+        "Frame: insurance unchanged"
+    );
 }
 
 /// Frame proof: deposit only mutates one account's capital, pnl, vault, and warmup globals
@@ -2150,6 +2119,7 @@ fn fast_valid_preserved_by_panic_settle_all() {
     engine.accounts[lp_idx as usize].entry_price = entry_price;
 
     engine.vault = U128::new(capital * 2);
+    sync_engine_aggregates(&mut engine);
 
     kani::assume(valid_state(&engine));
 
@@ -2193,20 +2163,16 @@ fn fast_valid_preserved_by_force_realize_losses() {
 
     engine.insurance_fund.balance = U128::new(floor);
     engine.vault = U128::new(capital * 2 + floor);
-
-    let vault_before = engine.vault.get();
-    let insurance_before = engine.insurance_fund.balance.get();
+    sync_engine_aggregates(&mut engine);
 
     let res = engine.force_realize_losses(oracle_price);
 
     // Non-vacuity: force_realize must succeed
     assert!(res.is_ok(), "non-vacuity: force_realize_losses must succeed");
 
-    // Primary conservation: vault >= c_tot + insurance
-    let c_tot = engine.c_tot.get();
-    let insurance = engine.insurance_fund.balance.get();
+    // Primary conservation: vault >= c_tot + insurance (exact, no slack needed)
     assert!(
-        engine.vault.get() >= c_tot.saturating_add(insurance),
+        engine.vault.get() >= engine.c_tot.get() + engine.insurance_fund.balance.get(),
         "force_realize must maintain primary conservation (V >= C_tot + I)"
     );
 }
@@ -3072,11 +3038,11 @@ fn proof_close_account_includes_warmed_pnl() {
     );
 }
 
-/// close_account rejects if pnl < 0 after full settlement (insolvent / invariant violation boundary)
+/// close_account succeeds with 0 capital when pnl < 0 (neg pnl written off per §6.1)
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
-fn proof_close_account_rejects_negative_pnl() {
+fn proof_close_account_negative_pnl_written_off() {
     let mut engine = RiskEngine::new(test_params());
     let user = engine.add_user(0).unwrap();
 
@@ -4258,7 +4224,7 @@ fn withdrawal_maintains_margin_above_maintenance() {
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
-fn withdrawal_rejects_if_below_maintenance_at_oracle() {
+fn withdrawal_rejects_if_below_initial_margin_at_oracle() {
     let mut engine = RiskEngine::new(test_params());
 
     // Create account and deposit capital via proper API (maintains c_tot/vault)
