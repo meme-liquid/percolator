@@ -194,6 +194,11 @@ fn valid_state(engine: &RiskEngine) -> bool {
             let idx = block * 64 + bit;
             w &= w - 1;
 
+            // Guard: reject states with bitmap bits beyond MAX_ACCOUNTS
+            if idx >= MAX_ACCOUNTS {
+                return false;
+            }
+
             let account = &engine.accounts[idx];
 
             // NOTE: Skipped matcher array check (causes memcmp unwinding issues)
@@ -305,6 +310,11 @@ fn inv_structural(engine: &RiskEngine) -> bool {
 }
 
 /// Accounting invariant: conservation (haircut system)
+///
+/// This checks the **primary conservation inequality only**: vault >= c_tot + insurance.
+/// Mark-to-market / funding conservation is verified by operation-specific proofs
+/// via check_conservation(oracle), which includes variation margin terms.
+/// Aggregate sum correctness is checked by inv_aggregates.
 fn inv_accounting(engine: &RiskEngine) -> bool {
     // A1: Primary conservation: vault >= c_tot + insurance
     // This is the fundamental invariant in the haircut system.
@@ -317,6 +327,12 @@ fn inv_accounting(engine: &RiskEngine) -> bool {
     }
 
     true
+}
+
+/// N1 boundary condition: after settlement boundaries (settle/withdraw/deposit/trade/liquidation),
+/// either pnl >= 0 or capital == 0. This prevents unrealized losses lingering with capital.
+fn n1_boundary_holds(account: &percolator::Account) -> bool {
+    account.pnl.get() >= 0 || account.capital.get() == 0
 }
 
 /// Fast conservation check for proofs with no open positions / funding.
@@ -523,6 +539,11 @@ fn recompute_totals(engine: &RiskEngine) -> Totals {
             let bit = w.trailing_zeros() as usize;
             let idx = block * 64 + bit;
             w &= w - 1;
+
+            // Guard: reject states with bitmap bits beyond MAX_ACCOUNTS
+            if idx >= MAX_ACCOUNTS {
+                return Totals { sum_capital: 0, sum_pnl_pos: 0, sum_pnl_neg_abs: 0 };
+            }
 
             let account = &engine.accounts[idx];
             sum_capital = sum_capital.saturating_add(account.capital.get());
@@ -1731,7 +1752,7 @@ fn fast_frame_deposit_only_mutates_one_account_vault_and_warmup() {
     let other_idx = engine.add_user(0).unwrap();
 
     let amount: u128 = kani::any();
-    kani::assume(amount < 10_000);
+    kani::assume(amount > 0 && amount < 10_000);
 
     // Snapshot before
     let other_snapshot = snapshot_account(&engine.accounts[other_idx as usize]);
@@ -1897,24 +1918,24 @@ fn fast_frame_settle_warmup_only_mutates_one_account_and_warmup_globals() {
     engine.insurance_fund.balance = U128::new(10_000);
     engine.vault = U128::new(capital + 10_000 + pnl as u128);
     engine.current_slot = slots;
+    sync_engine_aggregates(&mut engine);
 
     // Snapshot other account
     let other_snapshot = snapshot_account(&engine.accounts[other_idx as usize]);
 
-    // Settle warmup — guard Ok path
-    let result = engine.settle_warmup_to_capital(user_idx);
-    if result.is_ok() {
-        // Assert: other account unchanged
-        let other_after = &engine.accounts[other_idx as usize];
-        assert!(
-            other_after.capital.get() == other_snapshot.capital,
-            "Frame: other capital unchanged"
-        );
-        assert!(
-            other_after.pnl.get() == other_snapshot.pnl,
-            "Frame: other pnl unchanged"
-        );
-    }
+    // Settle warmup — force Ok for non-vacuity
+    engine.settle_warmup_to_capital(user_idx).unwrap();
+
+    // Assert: other account unchanged
+    let other_after = &engine.accounts[other_idx as usize];
+    assert!(
+        other_after.capital.get() == other_snapshot.capital,
+        "Frame: other capital unchanged"
+    );
+    assert!(
+        other_after.pnl.get() == other_snapshot.pnl,
+        "Frame: other pnl unchanged"
+    );
 }
 
 /// Frame proof: update_warmup_slope only mutates one account
@@ -1931,39 +1952,39 @@ fn fast_frame_update_warmup_slope_only_mutates_one_account() {
 
     engine.accounts[user_idx as usize].pnl = I128::new(pnl);
     engine.vault = U128::new(10_000);
+    sync_engine_aggregates(&mut engine);
 
     // Snapshot
     let other_snapshot = snapshot_account(&engine.accounts[other_idx as usize]);
     let globals_before = snapshot_globals(&engine);
 
-    // Update slope — guard Ok path
-    let result = engine.update_warmup_slope(user_idx);
-    if result.is_ok() {
-        // Assert: other account unchanged
-        let other_after = &engine.accounts[other_idx as usize];
-        assert!(
-            other_after.capital.get() == other_snapshot.capital,
-            "Frame: other capital unchanged"
-        );
-        assert!(
-            other_after.pnl.get() == other_snapshot.pnl,
-            "Frame: other pnl unchanged"
-        );
-        assert!(
-            other_after.warmup_slope_per_step.get() == other_snapshot.warmup_slope_per_step,
+    // Update slope — force Ok for non-vacuity
+    engine.update_warmup_slope(user_idx).unwrap();
+
+    // Assert: other account unchanged
+    let other_after = &engine.accounts[other_idx as usize];
+    assert!(
+        other_after.capital.get() == other_snapshot.capital,
+        "Frame: other capital unchanged"
+    );
+    assert!(
+        other_after.pnl.get() == other_snapshot.pnl,
+        "Frame: other pnl unchanged"
+    );
+    assert!(
+        other_after.warmup_slope_per_step.get() == other_snapshot.warmup_slope_per_step,
         "Frame: other slope unchanged"
     );
 
-        // Assert: globals unchanged
-        assert!(
-            engine.vault.get() == globals_before.vault,
-            "Frame: vault unchanged"
-        );
-        assert!(
-            engine.insurance_fund.balance.get() == globals_before.insurance_balance,
-            "Frame: insurance unchanged"
-        );
-    }
+    // Assert: globals unchanged
+    assert!(
+        engine.vault.get() == globals_before.vault,
+        "Frame: vault unchanged"
+    );
+    assert!(
+        engine.insurance_fund.balance.get() == globals_before.insurance_balance,
+        "Frame: insurance unchanged"
+    );
 }
 
 // ============================================================================
@@ -1980,7 +2001,7 @@ fn fast_valid_preserved_by_deposit() {
     let user_idx = engine.add_user(0).unwrap();
 
     let amount: u128 = kani::any();
-    kani::assume(amount < 10_000);
+    kani::assume(amount > 0 && amount < 10_000);
 
     kani::assume(valid_state(&engine));
 
@@ -2011,9 +2032,9 @@ fn fast_valid_preserved_by_withdraw() {
 
     let res = engine.withdraw(user_idx, withdraw, 0, 1_000_000);
 
-    if res.is_ok() {
-        assert!(valid_state(&engine), "valid_state preserved by withdraw");
-    }
+    // Non-vacuity: withdraw must succeed (no position, withdraw <= deposit)
+    assert!(res.is_ok(), "non-vacuity: withdraw must succeed");
+    assert!(valid_state(&engine), "valid_state preserved by withdraw");
 }
 
 /// Validity preserved by execute_trade
@@ -2078,17 +2099,18 @@ fn fast_valid_preserved_by_settle_warmup_to_capital() {
     } else {
         engine.vault = U128::new(capital + insurance);
     }
+    sync_engine_aggregates(&mut engine);
 
     kani::assume(valid_state(&engine));
 
     let res = engine.settle_warmup_to_capital(user_idx);
 
-    if res.is_ok() {
-        assert!(
-            valid_state(&engine),
-            "valid_state preserved by settle_warmup_to_capital"
-        );
-    }
+    // Non-vacuity: settle_warmup must succeed (account is used, bounded inputs)
+    assert!(res.is_ok(), "non-vacuity: settle_warmup must succeed");
+    assert!(
+        valid_state(&engine),
+        "valid_state preserved by settle_warmup_to_capital"
+    );
 }
 
 /// Validity preserved by panic_settle_all
@@ -3290,7 +3312,7 @@ fn proof_lq1_liquidation_reduces_oi_and_enforces_safety() {
     engine.accounts[user as usize].entry_price = 1_000_000;
     engine.accounts[user as usize].pnl = I128::new(0); // slope=0 means no settle noise
     engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    engine.total_open_interest = U128::new(10_000_000);
+    sync_engine_aggregates(&mut engine);
 
     let oi_before = engine.total_open_interest;
 
@@ -3334,7 +3356,7 @@ fn proof_lq1_liquidation_reduces_oi_and_enforces_safety() {
 
     // N1 boundary: pnl >= 0 or capital == 0
     assert!(
-        account.pnl.get() >= 0 || account.capital.get() == 0,
+        n1_boundary_holds(account),
         "N1 boundary: pnl must be >= 0 OR capital must be 0"
     );
 }
@@ -3363,7 +3385,7 @@ fn proof_lq2_liquidation_preserves_conservation() {
     engine.accounts[lp as usize].entry_price = 1_000_000;
     engine.accounts[lp as usize].pnl = I128::new(0);
     engine.accounts[lp as usize].warmup_slope_per_step = U128::new(0);
-    engine.total_open_interest = U128::new(20_000_000);
+    sync_engine_aggregates(&mut engine);
 
     // Verify conservation before
     assert!(
@@ -3426,7 +3448,7 @@ fn proof_lq3a_profit_routes_through_adl() {
     engine.accounts[counterparty as usize].position_size = I128::new(-10_000_000);
     engine.accounts[counterparty as usize].entry_price = oracle_price;
     engine.accounts[counterparty as usize].warmup_slope_per_step = U128::new(0);
-    engine.total_open_interest = U128::new(20_000_000);
+    sync_engine_aggregates(&mut engine);
 
     // Verify conservation before liquidation
     assert!(
@@ -3489,7 +3511,7 @@ fn proof_lq4_liquidation_fee_paid_to_insurance() {
     engine.accounts[user as usize].position_size = I128::new(10_000_000); // 10 units
     engine.accounts[user as usize].entry_price = 1_000_000; // entry at 1.0
     engine.accounts[user as usize].pnl = I128::new(0); // No settlement noise
-    engine.total_open_interest = U128::new(10_000_000);
+    sync_engine_aggregates(&mut engine);
 
     let insurance_before = engine.insurance_fund.balance;
 
@@ -3539,7 +3561,7 @@ fn proof_keeper_crank_best_effort_liquidation() {
     // Use entry = oracle to avoid ADL (mark_pnl = 0), making solver much faster
     engine.accounts[user as usize].position_size = I128::new(10_000_000); // Large position
     engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.total_open_interest = U128::new(10_000_000);
+    sync_engine_aggregates(&mut engine);
 
     // Deterministic values (avoids solver explosion from symbolic price)
     let oracle_price: u64 = 1_000_000;
@@ -3571,7 +3593,7 @@ fn proof_lq6_n1_boundary_after_liquidation() {
     engine.accounts[user as usize].entry_price = 1_000_000;
     engine.accounts[user as usize].pnl = I128::new(0);
     engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    engine.total_open_interest = U128::new(10_000_000);
+    sync_engine_aggregates(&mut engine);
 
     // Liquidate at oracle 1.0 (mark_pnl = 0)
     let oracle_price: u64 = 1_000_000;
@@ -3586,7 +3608,7 @@ fn proof_lq6_n1_boundary_after_liquidation() {
     // N1: After settlement, either pnl >= 0 or capital == 0
     // (negative PnL should have been realized from capital)
     assert!(
-        account.pnl.get() >= 0 || account.capital.get() == 0,
+        n1_boundary_holds(account),
         "N1 boundary: pnl must be >= 0 OR capital must be 0 after liquidation"
     );
 }
@@ -3615,7 +3637,6 @@ fn proof_liq_partial_1_safety_after_liquidation() {
     let position_size: i128 = 10_000_000; // 10 units (scaled by 1e6)
     engine.accounts[user as usize].position_size = I128::new(position_size);
     engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.total_open_interest = U128::new(position_size as u128);
 
     // Oracle price same as entry (no mark PnL)
     let oracle_price: u64 = 1_000_000;
@@ -3628,6 +3649,7 @@ fn proof_liq_partial_1_safety_after_liquidation() {
 
     // Match vault for conservation
     engine.vault = U128::new(50_000);
+    sync_engine_aggregates(&mut engine);
 
     let target_bps = engine
         .params
@@ -3670,13 +3692,13 @@ fn proof_liq_partial_2_dust_elimination() {
     // Give user a position
     engine.accounts[user as usize].position_size = I128::new(1_000_000);
     engine.accounts[user as usize].entry_price = 1_000_000;
-    engine.total_open_interest = U128::new(1_000_000);
 
     // Make user undercollateralized
     engine.accounts[user as usize].pnl = I128::new(-9_000);
 
     // Match vault for conservation
     engine.vault = U128::new(10_000);
+    sync_engine_aggregates(&mut engine);
 
     let min_liquidation_abs = engine.params.min_liquidation_abs;
 
@@ -3725,11 +3747,11 @@ fn proof_liq_partial_3_routing_is_complete_via_conservation_and_n1() {
     engine.accounts[user as usize].entry_price = 1_000_000;
     engine.accounts[counterparty as usize].position_size = I128::new(-1_000_000);
     engine.accounts[counterparty as usize].entry_price = 1_000_000;
-    engine.total_open_interest = U128::new(2_000_000);
 
     // Zero-sum PnL
     engine.accounts[user as usize].pnl = I128::new(-9_000);
     engine.accounts[counterparty as usize].pnl = I128::new(9_000);
+    sync_engine_aggregates(&mut engine);
 
     // Oracle = entry to ensure mark_pnl = 0 (simpler conservation)
     // User: capital 10k, pnl -9k => equity 1k, notional 1M, MM 50k => undercollateralized
@@ -3750,7 +3772,7 @@ fn proof_liq_partial_3_routing_is_complete_via_conservation_and_n1() {
 
     // N1 boundary: pnl >= 0 or capital == 0
     assert!(
-        account.pnl.get() >= 0 || account.capital.get() == 0,
+        n1_boundary_holds(account),
         "N1 boundary must hold after liquidation"
     );
 
@@ -3798,12 +3820,12 @@ fn proof_liq_partial_4_conservation_preservation() {
     engine.accounts[user as usize].entry_price = 1_000_000;
     engine.accounts[counterparty as usize].position_size = I128::new(-1_000_000);
     engine.accounts[counterparty as usize].entry_price = 1_000_000;
-    engine.total_open_interest = U128::new(2_000_000);
 
     // Zero-sum PnL (conservation-compliant)
     // User: capital 10k, pnl -9k => equity 1k, notional 1M, MM 50k => undercollateralized
     engine.accounts[user as usize].pnl = I128::new(-9_000);
     engine.accounts[counterparty as usize].pnl = I128::new(9_000);
+    sync_engine_aggregates(&mut engine);
 
     // Verify conservation before
     assert!(
@@ -3850,7 +3872,7 @@ fn proof_liq_partial_deterministic_reaches_target_or_full_close() {
     engine.accounts[user as usize].position_size = I128::new(10_000_000); // 10 units
     engine.accounts[user as usize].entry_price = 1_000_000; // entry at 1.0
     engine.accounts[user as usize].pnl = I128::new(0);
-    engine.total_open_interest = U128::new(10_000_000);
+    sync_engine_aggregates(&mut engine);
 
     let result = engine.liquidate_at_oracle(user, 0, oracle_price);
 
@@ -3869,7 +3891,7 @@ fn proof_liq_partial_deterministic_reaches_target_or_full_close() {
 
     // N1 boundary must hold
     assert!(
-        account.pnl.get() >= 0 || account.capital.get() == 0,
+        n1_boundary_holds(account),
         "N1 boundary must hold after liquidation"
     );
 
@@ -4722,12 +4744,10 @@ fn proof_liquidate_preserves_inv() {
     engine.accounts[lp_idx as usize].position_size = I128::new(-5_000_000);
     engine.accounts[lp_idx as usize].entry_price = oracle_price;
 
-    engine.total_open_interest = U128::new(10_000_000); // |5M| + |-5M|
-
     // vault = user_capital + lp_capital + insurance
     engine.vault = U128::new(500 + 50_000 + 10_000);
     engine.insurance_fund.balance = U128::new(10_000);
-    engine.recompute_aggregates();
+    sync_engine_aggregates(&mut engine);
 
     kani::assume(canonical_inv(&engine));
 
@@ -4818,7 +4838,7 @@ fn proof_settle_warmup_negative_pnl_immediate() {
 
         // N1 boundary: pnl >= 0 or capital == 0
         kani::assert(
-            account.pnl.get() >= 0 || account.capital.get() == 0,
+            n1_boundary_holds(account),
             "N1: after settle, pnl >= 0 OR capital == 0",
         );
 
