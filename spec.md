@@ -1,6 +1,6 @@
-# Risk Engine Spec (Source of Truth) — v4 (Fee-Debt-as-Liability + Crank Warmup + Initial Margin + Funding Anti-Retroactivity)
+# Risk Engine Spec (Source of Truth) — v5 (Fee-Debt-as-Liability + Crank Warmup + Initial Margin + Funding Anti-Retroactivity + Position Flip as Risk-Increasing)
 **Design:** **Protected Principal + Junior Profit Claims with Global Haircut Ratio**  
-**Status:** Implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)   (updated: fee debt is margin liability; crank advances warmup; risk-increasing trades use initial margin; funding accrual is anti-retroactive)
+**Status:** Implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)   (updated: fee debt is margin liability; crank advances warmup; risk-increasing trades use initial margin; funding accrual is anti-retroactive; position sign-flips require initial margin)
 **Scope:** Perpetual DEX risk engine for a single quote-token vault (e.g., Solana program-owned vault).  
 
 **Goal:** Achieve the same safety goals as the prior design (oracle manipulation resistance within a warmup window, principal protection, bounded insolvency handling, conservation, and liveness) with **no global ADL scans** and **no “recover stranded” function**, while preventing “PnL zombie” accounts from indefinitely poisoning the global haircut ratio.
@@ -338,6 +338,16 @@ Account is healthy if:
 - Maintenance: `Eq_mtm_net_i > MM_req`
 - Initial (for risk-increasing ops): `Eq_mtm_net_i ≥ IM_req`
 
+#### 9.1.1 Risk-increasing definition (normative)
+A trade is **risk-increasing** for account `i` when **either**:
+1. `|new_pos_i| > |old_pos_i|` (position magnitude increases), **or**
+2. `sign(new_pos_i) ≠ sign(old_pos_i)` and both are non-zero (position **crosses zero**, i.e., flips from long to short or vice versa).
+
+**Rationale:** A position flip is semantically a close + open of the opposite side. Although the final magnitude may be ≤ the original, the trader is establishing a **new directional exposure**. Therefore the new position MUST meet initial margin, not merely maintenance margin.
+
+**Implementation note:** "crosses zero" can be detected as:
+- `(old_pos > 0 && new_pos < 0) || (old_pos < 0 && new_pos > 0)`
+
 ### 9.2 Liquidation eligibility
 An account is liquidatable when:
 - `pos_i != 0` AND after a full settle-to-oracle (funding + mark + fees + loss settle + fee-debt sweep),  
@@ -413,7 +423,7 @@ Procedure:
 8. Enforce post-trade margin using `Eq_mtm_net` at oracle:
    - **Always:** `Eq_mtm_net > MM_req` (maintenance margin).
    - **If risk-increasing:** `Eq_mtm_net ≥ IM_req` (initial margin).
-   A trade is risk-increasing for account `i` when `|new_pos_i| > |old_pos_i|`.
+   A trade is risk-increasing per §9.1.1 (magnitude increase **or** position flip).
    This prevents opening positions at the liquidation boundary.
 9. Perform fee-debt sweep (§6.3) if any principal was created during settlement/conversion.
 
@@ -466,7 +476,7 @@ An implementation MUST include tests that cover:
    - fee debt reduces `Eq_mtm_net` and can make abandoned positions liquidatable.
 7. **Fee debt sweep:** ensure that if crank/user ops create principal via conversion, fee debt is paid down immediately (no fee bypass).
 8. **Funding anti-retroactivity:** simulate a long `dt` where LP inventory (or other rate input) changes near the end; confirm funding charged over the earlier interval uses the pre-change rate (no retroactive application), and only the post-change interval uses the new rate.
-9. **IM for risk-increasing trades:** confirm that opening a new position or increasing `|pos|` requires initial margin, while risk-reducing trades only require maintenance margin. Specifically, a trade that would leave `Eq_mtm_net` between MM and IM must be rejected if risk-increasing but allowed if risk-reducing.
+9. **IM for risk-increasing trades:** confirm that opening a new position, increasing `|pos|`, **or flipping position sign** requires initial margin, while risk-reducing trades only require maintenance margin. Specifically, a trade that would leave `Eq_mtm_net` between MM and IM must be rejected if risk-increasing but allowed if risk-reducing. Position flips (long→short or short→long) MUST be treated as risk-increasing even if `|new_pos| ≤ |old_pos|`.
 
 ---
 

@@ -2886,10 +2886,14 @@ impl RiskEngine {
                 saturating_abs_i128(new_user_position) as u128,
                 oracle_price as u128,
             ) / 1_000_000;
-            // Risk-increasing if |new_pos| > |old_pos|
-            let old_user_pos_abs = saturating_abs_i128(user.position_size.get());
+            // Risk-increasing if |new_pos| > |old_pos| OR position crosses zero (flip)
+            // A flip is semantically a close + open, so the new side must meet initial margin
+            let old_user_pos = user.position_size.get();
+            let old_user_pos_abs = saturating_abs_i128(old_user_pos);
             let new_user_pos_abs = saturating_abs_i128(new_user_position);
-            let user_risk_increasing = new_user_pos_abs > old_user_pos_abs;
+            let user_crosses_zero =
+                (old_user_pos > 0 && new_user_position < 0) || (old_user_pos < 0 && new_user_position > 0);
+            let user_risk_increasing = new_user_pos_abs > old_user_pos_abs || user_crosses_zero;
             let margin_bps = if user_risk_increasing {
                 self.params.initial_margin_bps
             } else {
@@ -2923,10 +2927,14 @@ impl RiskEngine {
                 saturating_abs_i128(new_lp_position) as u128,
                 oracle_price as u128,
             ) / 1_000_000;
-            // Risk-increasing if |new_pos| > |old_pos|
-            let old_lp_pos_abs = saturating_abs_i128(lp.position_size.get());
+            // Risk-increasing if |new_pos| > |old_pos| OR position crosses zero (flip)
+            // A flip is semantically a close + open, so the new side must meet initial margin
+            let old_lp_pos = lp.position_size.get();
+            let old_lp_pos_abs = saturating_abs_i128(old_lp_pos);
             let new_lp_pos_abs = saturating_abs_i128(new_lp_position);
-            let lp_risk_increasing = new_lp_pos_abs > old_lp_pos_abs;
+            let lp_crosses_zero =
+                (old_lp_pos > 0 && new_lp_position < 0) || (old_lp_pos < 0 && new_lp_position > 0);
+            let lp_risk_increasing = new_lp_pos_abs > old_lp_pos_abs || lp_crosses_zero;
             let margin_bps = if lp_risk_increasing {
                 self.params.initial_margin_bps
             } else {
