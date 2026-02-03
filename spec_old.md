@@ -1,9 +1,8 @@
-# Risk Engine Spec (Source of Truth) — v2 (Fee-Debt-as-Liability + Crank Warmup Progress)
+# Risk Engine Spec (Source of Truth)
 **Design:** **Protected Principal + Junior Profit Claims with Global Haircut Ratio**  
 **Status:** Implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)  
 **Scope:** Perpetual DEX risk engine for a single quote-token vault (e.g., Solana program-owned vault).  
-
-**Goal:** Achieve the same safety goals as the prior design (oracle manipulation resistance within a warmup window, principal protection, bounded insolvency handling, conservation, and liveness) with **no global ADL scans** and **no “recover stranded” function**, while preventing “PnL zombie” accounts from indefinitely poisoning the global haircut ratio.
+**Goal:** Achieve the same safety goals as the prior design (oracle manipulation resistance within a warmup window, principal protection, bounded insolvency handling, conservation, and liveness) with **no global ADL scans** and **no “recover stranded” function**.
 
 ---
 
@@ -15,7 +14,6 @@ The engine MUST provide the following properties:
 3. **Profit-first haircuts:** When the system is undercollateralized, haircuts MUST apply to **junior profit claims** (positive PnL not yet converted to principal) before any protected principal is impacted.
 4. **Conservation:** The engine MUST NOT create withdrawable claims exceeding vault tokens, except for a bounded rounding slack (explicitly specified).
 5. **Liveness:** The system MUST NOT require “all OI = 0” or manual admin recovery to resume safe withdrawals. In particular, a surviving profitable LP position MUST NOT block accounting progress.
-6. **No zombie poisoning:** A non-interacting account MUST NOT be able to indefinitely keep `PNL_pos_tot` arbitrarily large relative to `Residual` and thereby collapse the global haircut ratio for all users. The engine MUST ensure accounting progress (warmup conversion of eligible profits) occurs without requiring the owner to call user ops.
 
 ---
 
@@ -58,14 +56,9 @@ Position/funding fields (if perp trading supported):
 - `entry_i: u64` — last settlement reference price (variation margin anchor).
 - `f_snap_i: i128` — funding index snapshot.
 
-Fees (recommended):
+Fees (optional but recommended):
 - `fee_credits_i: i128` — prepaid maintenance credits (may go negative if debt).
 - `last_fee_slot_i: u64`
-
-**Fee debt definition (new, normative):**
-- `FeeDebt_i = max(0, -fee_credits_i)` (in quote units)
-- `FeeDebt_i` is a **liability** used for margin checks and liquidation eligibility (see §3.3, §9).
-- `FeeDebt_i` is **not** part of the haircut solvency math (does not affect `Residual` or `PNL_pos_tot` directly); it is an account-local constraint that reduces risk capacity and enables cleanup.
 
 ### 2.2 Global engine state
 The engine stores at least:
@@ -107,7 +100,7 @@ Let:
   - `h_den = PNL_pos_tot`
   - `h = h_num / h_den` (in `[0, 1]`)
 
-### 3.3 Effective positive PnL and **effective equity for margin**
+### 3.3 Effective positive PnL and effective equity
 For account `i`:
 - `PNL_pos_i = max(PNL_i, 0)`
 - `PNL_eff_pos_i`:
@@ -121,15 +114,8 @@ If MTM is needed at oracle price `P`:
 - `mark_i = mark_pnl(pos_i, entry_i, P)` (signed i128)
 - `Eq_mtm_i = max(0, Eq_real_i as i128 + mark_i)` (clamp to 0)
 
-**Fee debt as margin liability (new, normative):**
-- `Eq_mtm_net_i = max(0, (Eq_mtm_i as i128) - (FeeDebt_i as i128))`
-
-**All margin checks MUST use `Eq_mtm_net_i`.**  
+**All margin checks MUST use `Eq_mtm_i`.**  
 (If the engine always performs variation-margin settlement to oracle before checks, then `mark_i = 0` and `Eq_mtm_i == Eq_real_i` at that oracle.)
-
-**Notes (normative intent):**
-- Positive `fee_credits_i` MUST NOT increase margin equity (prepaid credits are not extra collateral).
-- Negative `fee_credits_i` (fee debt) MUST reduce margin equity to enable liquidation / cleanup of abandoned accounts.
 
 ### 3.4 Rounding and conservation
 Because each `PNL_eff_pos_i` is floored independently:
@@ -222,17 +208,6 @@ Then update warmup slope per Section 5.4.
 
 **Important property:** If `y = floor(x*h)`, conversions are order-independent up to rounding: they do not require global scans and do not change `h` except by bounded rounding.
 
-### 6.3 Fee-debt sweep after conversion (new, normative)
-After any operation that increases `C_i` (including profit conversion), the engine MUST immediately attempt to pay down maintenance fee debt:
-1. `debt = FeeDebt_i = max(0, -fee_credits_i)`
-2. `pay = min(debt, C_i)`
-3. Apply:
-   - `C_i -= pay` (update `C_tot`)
-   - `fee_credits_i += pay` (toward zero)
-   - `I += pay` (insurance receives the payment as maintenance revenue)
-
-This prevents a crank-driven conversion from “creating capital” that bypasses accrued fees.
-
 ---
 
 ## 7. Funding and variation margin (if perpetual trading supported)
@@ -259,7 +234,7 @@ Then margin checks can use `mark = 0` at that oracle.
 
 ---
 
-## 8. Fees
+## 8. Fees (recommended)
 
 ### 8.1 Trading fees (senior, paid to insurance)
 Trading fees MUST NOT be socialized via the haircut ratio. They are explicit transfers to insurance.
@@ -270,16 +245,10 @@ When charging a fee `fee`:
 - Credit insurance:
   - `I += fee`
 
-### 8.2 Maintenance fees (paid to insurance; may create fee debt)
+### 8.2 Maintenance fees (optional)
 Maintenance fees may be charged per slot, paid to insurance. If `fee_credits_i` exist, they SHOULD be spent first.
 
-If an account cannot pay maintenance due to insufficient principal, it accrues fee debt (`fee_credits_i < 0`).
-
-**New, normative interaction with risk:**
-- Fee debt MUST reduce margin equity via `Eq_mtm_net_i` (§3.3).
-- Fee debt MUST be swept from principal whenever principal becomes available (§6.3).
-
-Fee debt does not directly affect `h` (no system-wide claim is created), but it does enforce eventual liquidation/cleanup pressure on abandoned accounts.
+If an account cannot pay maintenance due to zero principal, it accrues fee debt; this does not create a system-wide claim and does not affect `h` directly.
 
 ---
 
@@ -292,22 +261,21 @@ At oracle price `P`:
 - `IM_req = Notional_i * initial_bps / 10_000`
 
 Account is healthy if:
-- Maintenance: `Eq_mtm_net_i > MM_req`
-- Initial (for risk-increasing ops): `Eq_mtm_net_i ≥ IM_req`
+- Maintenance: `Eq_mtm_i > MM_req`
+- Initial (for risk-increasing ops): `Eq_mtm_i ≥ IM_req`
 
 ### 9.2 Liquidation eligibility
 An account is liquidatable when:
-- `pos_i != 0` AND after a full settle-to-oracle (funding + mark + fees + loss settle + fee-debt sweep),  
-  `Eq_mtm_net_i ≤ MM_req`.
+- `pos_i != 0` AND after a full settle-to-oracle (funding + mark + fees + loss settle),  
+  `Eq_mtm_i ≤ MM_req`.
 
 ### 9.3 Liquidation execution (oracle-close)
 Liquidation MAY be full or partial. Any liquidation MUST:
 1. Close some position at oracle (or via matching engine), realizing mark into `PNL_i` via `set_pnl`.
 2. Immediately run:
-   - loss settlement (§6.1)
-   - profit conversion (§6.2) (recommended)
-   - fee-debt sweep (§6.3)
-3. Charge liquidation fee from protected principal to insurance (§8.1).
+   - loss settlement (Section 6.1)
+   - profit conversion (Section 6.2) (optional, but recommended to keep state tidy)
+3. Charge liquidation fee from protected principal to insurance (Section 8).
 
 **No global scans are permitted or required.**  
 The system remains live regardless of `OI_tot`.
@@ -317,16 +285,15 @@ The system remains live regardless of `OI_tot`.
 ## 10. External operations: preconditions and effects
 
 ### 10.1 `touch_account_full(i, oracle_price, now_slot)`
-Canonical settle routine used by all user ops.
+This is a canonical settle routine used by all user ops.
 
 MUST perform, in this exact order:
 1. Set `current_slot = now_slot`.
-2. Settle funding into `PNL_i` (§7.2).
-3. Settle mark-to-oracle into `PNL_i` and set `entry_i = oracle_price` (§7.3).
-4. Charge fees/maintenance due (§8.2) (may create/extend fee debt).
-5. Settle losses immediately (§6.1).
-6. Convert warmable profits to principal (§6.2).
-7. Sweep fee debt from any newly available principal (§6.3).
+2. Settle funding into `PNL_i` (Section 7.2).
+3. Settle mark-to-oracle into `PNL_i` and set `entry_i = oracle_price` (Section 7.3).
+4. Charge fees/maintenance due (Section 8).
+5. Settle losses immediately (Section 6.1).
+6. Convert warmable profits to principal (Section 6.2).
 
 ### 10.2 `deposit(i, amount)`
 Preconditions:
@@ -336,7 +303,7 @@ Effects:
 - `V += amount`
 - `C_i += amount` (update `C_tot`)
 
-Then SHOULD call `touch_account_full` (to settle any old losses/fees) and MUST apply fee-debt sweep (§6.3) after any principal increase.
+Then SHOULD call `touch_account_full` (to settle any old losses/fees).
 
 ### 10.3 `withdraw(i, amount, oracle_price, now_slot)`
 Preconditions (recommended freshness gating):
@@ -347,7 +314,7 @@ Procedure:
 1. `touch_account_full(i, oracle_price, now_slot)`
 2. Ensure `amount ≤ C_i`
 3. Ensure post-withdraw margin at oracle:
-   - compute `Eq_mtm_net_i` after reducing `C_i` by `amount`
+   - compute `Eq_mtm_i` after reducing `C_i` by `amount`
    - require it meets initial margin if `pos_i != 0`
 
 Effects:
@@ -357,34 +324,25 @@ Effects:
 ### 10.4 `execute_trade(a, b, oracle_price, now_slot, size, exec_price)`
 Preconditions:
 - For any risk-increasing trade, freshness gating SHOULD be enforced.
-- Bounds: `oracle_price`, `exec_price`, and `size` MUST satisfy §1.3.
+- Bounds: `oracle_price`, `exec_price`, and `size` MUST satisfy Section 1.3.
 
 Procedure:
 1. `touch_account_full(a, oracle_price, now_slot)`
 2. `touch_account_full(b, oracle_price, now_slot)`
 3. Apply trade position deltas (ensuring bounds).
 4. Compute trade PnL (zero-sum before fees) and apply using `set_pnl`.
-5. Charge explicit trading fees to insurance (§8.1).
-6. Update warmup slopes for any account whose positive PnL increased (§5.4).
-7. Enforce post-trade maintenance margin using `Eq_mtm_net` at oracle.
-8. Perform fee-debt sweep (§6.3) if any principal was created during settlement/conversion.
+5. Charge explicit trading fees to insurance (Section 8.1).
+6. Update warmup slopes for any account whose positive PnL increased (Section 5.4).
+7. Enforce post-trade maintenance margin using `Eq_mtm` at oracle.
 
-### 10.5 `keeper_crank(...)` (optional but strongly recommended)
-A crank MAY:
+### 10.5 `keeper_crank(...)` (optional)
+A crank is optional in this spec; it MAY:
 - accrue funding
 - touch a bounded window of accounts to keep funding/mark/fees current
 - liquidate unhealthy accounts
-- garbage-collect dust accounts
-
-**New, normative requirement to prevent zombie poisoning:**
-- `keeper_crank` MUST invoke warmup profit conversion (§6.2) and fee-debt sweep (§6.3) for each account it touches (or for a bounded budgeted subset per crank), using the account’s warmup schedule.  
-- This ensures `PNL_pos_tot` cannot be permanently dominated by abandoned accounts that never call user ops.
-
-**Budgeting (allowed):**
-- The crank MAY limit work per call (e.g., only `N` accounts per call), as long as it maintains a cursor such that repeated calls eventually visit all active accounts.
 
 **Correctness MUST NOT depend on “OI==0” recovery or admin intervention.**  
-The haircut ratio `h` ensures continuous solvency of junior profits with no global scanning, and the crank ensures non-interactive progress of warmup conversion.
+The haircut ratio `h` ensures continuous solvency of junior profits with no global scanning.
 
 ---
 
@@ -393,7 +351,6 @@ Because the system never relies on a recovery function gated by `OI_tot == 0`.
 Instead:
 - undercollateralization is represented immediately as `Residual < PNL_pos_tot` which yields `h < 1`, and
 - all profit conversion uses `h` so it cannot mint unbacked principal,
-- and **crank-driven warmup conversion** ensures abandoned accounts do not indefinitely pin `PNL_pos_tot` and collapse `h` for everyone else,
 - regardless of open positions, as long as accounts are settled to oracle for operations that extract value.
 
 Therefore, a surviving profitable LP position cannot “block” anything; it is just an open position whose PnL is junior and haircutted if unbacked.
@@ -408,11 +365,6 @@ An implementation MUST include tests that cover:
 3. **Insolvency haircut:** force a loss beyond a loser’s principal and show winners’ conversions are haircutted but winners’ original principal is unaffected.
 4. **Liveness with OI>0:** reproduce “LP orphaned profitable position” scenario; show conversions/withdrawals remain possible without admin top-up, bounded by `h`.
 5. **Rounding bound:** worst-case distribution across many positive accounts respects slack bound.
-6. **Zombie poisoning regression:** create an idle account with `C=0`, `PNL>0`, and small position; run repeated cranks with realistic oracle moves and confirm:
-   - crank-driven profit conversion reduces `PNL_pos_tot` over time (according to warmup schedule),
-   - `h` recovers accordingly (no indefinite collapse),
-   - fee debt reduces `Eq_mtm_net` and can make abandoned positions liquidatable.
-7. **Fee debt sweep:** ensure that if crank/user ops create principal via conversion, fee debt is paid down immediately (no fee bypass).
 
 ---
 
@@ -428,22 +380,14 @@ else:
   h_den = PNL_pos_tot
 ```
 
-### 13.2 Effective positive PnL and fee-debt-adjusted margin equity
+### 13.2 Effective positive PnL
 ```text
 if PNL_i <= 0: PNL_eff_pos_i = 0
 else if PNL_pos_tot == 0: PNL_eff_pos_i = PNL_i
 else: PNL_eff_pos_i = floor(PNL_i * h_num / h_den)
-
-Eq_real_i = max(0, C_i + min(PNL_i, 0) + PNL_eff_pos_i)
-
-mark_i = mark_pnl(pos_i, entry_i, oracle_price)
-Eq_mtm_i = max(0, Eq_real_i + mark_i)
-
-FeeDebt_i = max(0, -fee_credits_i)
-Eq_mtm_net_i = max(0, Eq_mtm_i - FeeDebt_i)
 ```
 
-### 13.3 Loss settle then convert then sweep fee debt
+### 13.3 Loss settle then convert
 ```text
 # settle losses
 if PNL_i < 0:
@@ -461,13 +405,6 @@ if x > 0:
   C_i += y; C_tot += y
   w_start_i = current_slot
   update_warmup_slope(i)
-
-# sweep maintenance fee debt from any available principal
-debt = max(0, -fee_credits_i)
-pay = min(debt, C_i)
-C_i -= pay; C_tot -= pay
-fee_credits_i += pay
-I += pay
 ```
 
 ---
@@ -476,11 +413,7 @@ I += pay
 - The spec is compatible with **LP accounts** and **user accounts**; both share the same protected principal and junior profit mechanics.
 - The spec is compatible with a Solana “single slab account” implementation; the only required global aggregates are `C_tot` and `PNL_pos_tot` (both O(1) maintained).
 - The spec deliberately removes global ADL distribution, pending buckets, and stranded recovery.
-- The spec adds two constraints that improve lifecycle liveness without global scans:
-  1) fee debt is a margin liability (`Eq_mtm_net`), and  
-  2) crank must make warmup progress for touched accounts (no owner-touch dependency).
 
 ---
 
-**End of spec (v2).**
-
+**End of spec.**
