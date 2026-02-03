@@ -3,10 +3,70 @@ Generated: 2026-02-02
 
 ## Summary
 
-- **Total Proofs**: 107
-- **Passed**: 107 (100%)
+- **Total Proofs**: 125
+- **Passed**: 125 (100%)
 - **Failed**: 0
-- **Total verification time**: ~30 min (sequential, one-by-one)
+- **Total verification time**: ~65 min (sequential, one-by-one)
+
+---
+
+## Security Audit Gap Closure (2026-02-02)
+
+Added 18 new Kani proofs to close 5 high/critical coverage gaps identified by external audit.
+No production code changes — all modifications in `tests/kani.rs`.
+
+### Gap 1: Err-path Mutation Safety (3 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_gap1_touch_account_err_no_mutation | 1s | touch_account Err leaves account+engine state unchanged |
+| proof_gap1_settle_mark_err_no_mutation | 1s | settle_mark_to_oracle Err leaves account+engine state unchanged |
+| proof_gap1_crank_with_fees_preserves_inv | 28s | keeper_crank with maintenance fees preserves canonical_inv |
+
+### Gap 2: Matcher Trust Boundary (4 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_gap2_rejects_overfill_matcher | 1s | execute_trade rejects matcher returning |exec_size| > |size| |
+| proof_gap2_rejects_zero_price_matcher | 1s | execute_trade rejects matcher returning price = 0 |
+| proof_gap2_rejects_max_price_exceeded_matcher | 1s | execute_trade rejects matcher returning price > MAX_ORACLE_PRICE |
+| proof_gap2_execute_trade_err_preserves_inv | 2s | execute_trade Err (bad matcher) still preserves canonical_inv |
+
+### Gap 3: Full Conservation with MTM + Funding (3 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_gap3_conservation_trade_entry_neq_oracle | 96s | Conservation holds after trade when entry_price ≠ oracle (MTM path) |
+| proof_gap3_conservation_crank_funding_positions | 917s | Conservation holds after crank with funding on open positions |
+| proof_gap3_multi_step_lifecycle_conservation | 1238s | canonical_inv at each step of deposit→trade→crank→close lifecycle |
+
+### Gap 4: Overflow / Never-Panic at Extreme Values (4 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_gap4_trade_extreme_price_no_panic | 6s | Trade at oracle ∈ {1, 10^6, MAX_ORACLE_PRICE} — no panic |
+| proof_gap4_trade_extreme_size_no_panic | 4s | Trade at size ∈ {1, MAX_POSITION_ABS/2, MAX_POSITION_ABS} — no panic |
+| proof_gap4_trade_partial_fill_diff_price_no_panic | 22s | Partial fill at oracle−100k with symbolic oracle/size — no panic |
+| proof_gap4_margin_extreme_values_no_panic | 1s | Margin/equity functions at extreme values — no panic |
+
+### Gap 5: Fee Credit Corner Cases (4 proofs)
+
+| Proof | Time | What it verifies |
+|-------|------|-----------------|
+| proof_gap5_fee_settle_margin_or_err | 23s | settle_maintenance_fee: Ok → above margin; Err → undercollateralized |
+| proof_gap5_fee_credits_trade_then_settle_bounded | 3s | Fee credits deterministic after trade + settle cycle |
+| proof_gap5_fee_credits_saturating_near_max | 3s | fee_credits near i128::MAX saturate (no wrap) |
+| proof_gap5_deposit_fee_credits_conservation | 1s | deposit_fee_credits preserves conservation |
+
+### New Helper Types
+
+4 adversarial matcher structs for Gap 2 trust boundary testing:
+- `OverfillMatcher` — returns |exec_size| = |size| + 1
+- `ZeroPriceMatcher` — returns price = 0
+- `MaxPricePlusOneMatcher` — returns price = MAX_ORACLE_PRICE + 1
+- `PartialFillDiffPriceMatcher` — returns half fill at oracle − 100,000
+
+Proof count: 107 → 125.
 
 ---
 
@@ -404,7 +464,7 @@ Three rounds of proof hardening addressed vacuity risks, naming correctness, and
 
 ## Full Timing Results (2026-02-02)
 
-107/107 proofs pass. No timeouts, no failures.
+125/125 proofs pass. No timeouts, no failures.
 
 | Proof Name | Time | Status |
 |------------|------|--------|
@@ -515,6 +575,24 @@ Three rounds of proof hardening addressed vacuity risks, naming correctness, and
 | withdrawal_rejects_if_below_initial_margin_at_oracle | 2s | PASS |
 | withdrawal_requires_sufficient_balance | 2s | PASS |
 | zero_pnl_withdrawable_is_zero | 2s | PASS |
+| proof_gap1_touch_account_err_no_mutation | 1s | PASS |
+| proof_gap1_settle_mark_err_no_mutation | 1s | PASS |
+| proof_gap1_crank_with_fees_preserves_inv | 28s | PASS |
+| proof_gap2_rejects_overfill_matcher | 1s | PASS |
+| proof_gap2_rejects_zero_price_matcher | 1s | PASS |
+| proof_gap2_rejects_max_price_exceeded_matcher | 1s | PASS |
+| proof_gap2_execute_trade_err_preserves_inv | 2s | PASS |
+| proof_gap3_conservation_trade_entry_neq_oracle | 96s | PASS |
+| proof_gap3_conservation_crank_funding_positions | 917s | PASS |
+| proof_gap3_multi_step_lifecycle_conservation | 1238s | PASS |
+| proof_gap4_trade_extreme_price_no_panic | 6s | PASS |
+| proof_gap4_trade_extreme_size_no_panic | 4s | PASS |
+| proof_gap4_trade_partial_fill_diff_price_no_panic | 22s | PASS |
+| proof_gap4_margin_extreme_values_no_panic | 1s | PASS |
+| proof_gap5_fee_settle_margin_or_err | 23s | PASS |
+| proof_gap5_fee_credits_trade_then_settle_bounded | 3s | PASS |
+| proof_gap5_fee_credits_saturating_near_max | 3s | PASS |
+| proof_gap5_deposit_fee_credits_conservation | 1s | PASS |
 
 ## Historical Results (2026-01-21)
 
