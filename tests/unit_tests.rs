@@ -681,7 +681,7 @@ fn test_funding_positive_rate_longs_pay_shorts() {
 
     // Accrue positive funding: +10 bps/slot for 1 slot
     engine.current_slot = 1;
-    engine.accrue_funding(1, 100_000_000, 10).unwrap(); // price=$100, rate=+10bps
+    engine.accrue_funding_with_rate(1, 100_000_000, 10).unwrap(); // price=$100, rate=+10bps
 
     // Expected delta_F = 100e6 * 10 * 1 / 10000 = 100,000
     // User payment = 1M * 100,000 / 1e6 = 100,000
@@ -747,7 +747,7 @@ fn test_funding_negative_rate_shorts_pay_longs() {
 
     // Accrue negative funding: -10 bps/slot
     engine.current_slot = 1;
-    engine.accrue_funding(1, 100_000_000, -10).unwrap();
+    engine.accrue_funding_with_rate(1, 100_000_000, -10).unwrap();
 
     let user_pnl_before = engine.accounts[user_idx as usize].pnl;
     let lp_pnl_before = engine.accounts[lp_idx as usize].pnl;
@@ -780,7 +780,7 @@ fn test_funding_idempotence() {
     engine.accounts[user_idx as usize].position_size = I128::new(1_000_000);
 
     // Accrue funding
-    engine.accrue_funding(1, 100_000_000, 10).unwrap();
+    engine.accrue_funding_with_rate(1, 100_000_000, 10).unwrap();
 
     // Settle once
     engine.touch_account(user_idx).unwrap();
@@ -821,7 +821,7 @@ fn test_funding_partial_close() {
 
     // Accrue funding for 1 slot at +10 bps
     engine.advance_slot(1);
-    engine.accrue_funding(1, 100_000_000, 10).unwrap();
+    engine.accrue_funding_with_rate(1, 100_000_000, 10).unwrap();
 
     // Reduce position to 1M (close half)
     let reduce_result =
@@ -836,7 +836,7 @@ fn test_funding_partial_close() {
 
     // Accrue more funding for another slot
     engine.advance_slot(2);
-    engine.accrue_funding(2, 100_000_000, 10).unwrap();
+    engine.accrue_funding_with_rate(2, 100_000_000, 10).unwrap();
 
     // Touch to settle
     engine.touch_account(user_idx).unwrap();
@@ -873,7 +873,7 @@ fn test_funding_position_flip() {
 
     // Accrue funding
     engine.advance_slot(1);
-    engine.accrue_funding(1, 100_000_000, 10).unwrap();
+    engine.accrue_funding_with_rate(1, 100_000_000, 10).unwrap();
 
     let _pnl_before_flip = engine.accounts[user_idx as usize].pnl;
 
@@ -896,7 +896,7 @@ fn test_funding_position_flip() {
 
     // Accrue more funding
     engine.advance_slot(2);
-    engine.accrue_funding(2, 100_000_000, 10).unwrap();
+    engine.accrue_funding_with_rate(2, 100_000_000, 10).unwrap();
 
     engine.touch_account(user_idx).unwrap();
 
@@ -918,7 +918,7 @@ fn test_funding_zero_position() {
     let pnl_before = engine.accounts[user_idx as usize].pnl;
 
     // Accrue funding
-    engine.accrue_funding(1, 100_000_000, 100).unwrap(); // Large rate
+    engine.accrue_funding_with_rate(1, 100_000_000, 100).unwrap(); // Large rate
 
     // Settle
     engine.touch_account(user_idx).unwrap();
@@ -939,7 +939,7 @@ fn test_funding_does_not_touch_principal() {
     engine.accounts[user_idx as usize].position_size = I128::new(1_000_000);
 
     // Accrue funding
-    engine.accrue_funding(1, 100_000_000, 100).unwrap();
+    engine.accrue_funding_with_rate(1, 100_000_000, 100).unwrap();
     engine.touch_account(user_idx).unwrap();
 
     // Principal must be unchanged
@@ -1386,7 +1386,7 @@ fn api_sequence_conservation_smoke_test() {
     assert_conserved(&engine);
 
     // Accrue funding
-    engine.accrue_funding(1, 1_000_000, 10).unwrap();
+    engine.accrue_funding_with_rate(1, 1_000_000, 10).unwrap();
     engine.touch_account(user).unwrap();
     assert_conserved(&engine);
 

@@ -1197,7 +1197,7 @@ fn funding_p5_bounded_operations_no_overflow() {
     engine.last_funding_slot = 0;
 
     // Accrue should not panic
-    let result = engine.accrue_funding(dt, price, rate);
+    let result = engine.accrue_funding_with_rate(dt, price, rate);
 
     // Either succeeds or returns Overflow error (never panics)
     if result.is_err() {

@@ -307,6 +307,11 @@ pub struct RiskEngine {
     /// Last slot when funding was accrued
     pub last_funding_slot: u64,
 
+    /// Funding rate (bps per slot) in effect starting at last_funding_slot.
+    /// This is the rate used for the interval [last_funding_slot, next_accrual).
+    /// Anti-retroactivity: state changes at slot t can only affect funding for slots >= t.
+    pub funding_rate_bps_per_slot_last: i64,
+
     // ========================================
     // Keeper Crank Tracking
     // ========================================
@@ -643,6 +648,7 @@ impl RiskEngine {
             current_slot: 0,
             funding_index_qpb_e6: I128::ZERO,
             last_funding_slot: 0,
+            funding_rate_bps_per_slot_last: 0,
             last_crank_slot: 0,
             max_crank_staleness_slots: params.max_crank_staleness_slots,
             total_open_interest: U128::ZERO,
@@ -1498,8 +1504,14 @@ impl RiskEngine {
             self.lp_max_abs_sweep = U128::ZERO;
         }
 
-        // Accrue funding first (always) - propagate errors, don't continue with corrupt state
-        self.accrue_funding(now_slot, oracle_price, funding_rate_bps_per_slot)?;
+        // Accrue funding first using the STORED rate (anti-retroactivity).
+        // This ensures funding charged for the elapsed interval uses the rate that was
+        // in effect at the start of the interval, NOT the new rate computed from current state.
+        self.accrue_funding(now_slot, oracle_price)?;
+
+        // Now set the new rate for the NEXT interval (anti-retroactivity).
+        // The funding_rate_bps_per_slot parameter becomes the rate for [now_slot, next_accrual).
+        self.set_funding_rate_for_next_interval(funding_rate_bps_per_slot);
 
         // Check if we're advancing the global crank slot
         let advanced = now_slot > self.last_crank_slot;
@@ -2080,13 +2092,13 @@ impl RiskEngine {
     // Funding
     // ========================================
 
-    /// Accrue funding globally in O(1)
-    pub fn accrue_funding(
-        &mut self,
-        now_slot: u64,
-        oracle_price: u64,
-        funding_rate_bps_per_slot: i64,
-    ) -> Result<()> {
+    /// Accrue funding globally in O(1) using the stored rate (anti-retroactivity).
+    ///
+    /// This uses `funding_rate_bps_per_slot_last` - the rate in effect since `last_funding_slot`.
+    /// The rate for the NEXT interval is set separately via `set_funding_rate_for_next_interval`.
+    ///
+    /// Anti-retroactivity guarantee: state changes at slot t can only affect funding for slots >= t.
+    pub fn accrue_funding(&mut self, now_slot: u64, oracle_price: u64) -> Result<()> {
         let dt = now_slot.saturating_sub(self.last_funding_slot);
         if dt == 0 {
             return Ok(());
@@ -2097,9 +2109,12 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
+        // Use the STORED rate (anti-retroactivity: rate was set at start of interval)
+        let funding_rate = self.funding_rate_bps_per_slot_last;
+
         // Cap funding rate at 10000 bps (100%) per slot as sanity bound
         // Real-world funding rates should be much smaller (typically < 1 bps/slot)
-        if funding_rate_bps_per_slot.abs() > 10_000 {
+        if funding_rate.abs() > 10_000 {
             return Err(RiskError::Overflow);
         }
 
@@ -2109,7 +2124,7 @@ impl RiskEngine {
 
         // Use checked math to prevent silent overflow
         let price = oracle_price as i128;
-        let rate = funding_rate_bps_per_slot as i128;
+        let rate = funding_rate as i128;
         let dt_i = dt as i128;
 
         // ΔF = price × rate × dt / 10,000
@@ -2128,6 +2143,32 @@ impl RiskEngine {
 
         self.last_funding_slot = now_slot;
         Ok(())
+    }
+
+    /// Set the funding rate for the NEXT interval (anti-retroactivity).
+    ///
+    /// MUST be called AFTER `accrue_funding()` to ensure the old rate is applied to
+    /// the elapsed interval before storing the new rate.
+    ///
+    /// This implements the "rate-change rule" from the spec: state changes at slot t
+    /// can only affect funding for slots >= t.
+    pub fn set_funding_rate_for_next_interval(&mut self, new_rate_bps_per_slot: i64) {
+        self.funding_rate_bps_per_slot_last = new_rate_bps_per_slot;
+    }
+
+    /// Convenience: Set rate then accrue in one call.
+    ///
+    /// This sets the rate for the interval being accrued, then accrues.
+    /// For proper anti-retroactivity in production, the rate should be set at the
+    /// START of an interval via `set_funding_rate_for_next_interval`, then accrued later.
+    pub fn accrue_funding_with_rate(
+        &mut self,
+        now_slot: u64,
+        oracle_price: u64,
+        funding_rate_bps_per_slot: i64,
+    ) -> Result<()> {
+        self.set_funding_rate_for_next_interval(funding_rate_bps_per_slot);
+        self.accrue_funding(now_slot, oracle_price)
     }
 
     /// Settle funding for an account (lazy update)

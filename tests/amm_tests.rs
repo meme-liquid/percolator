@@ -119,7 +119,7 @@ fn test_e2e_complete_user_journey() {
     // Accrue funding rate (longs pay shorts)
     engine.advance_slot(10);
     engine
-        .accrue_funding(engine.current_slot, new_price, 100)
+        .accrue_funding_with_rate(engine.current_slot, new_price, 100)
         .unwrap(); // 100 bps/slot, longs pay
 
     // Settle funding for users
@@ -321,7 +321,7 @@ fn test_e2e_funding_complete_cycle() {
     // Advance time and accrue funding (longs pay shorts)
     engine.advance_slot(20);
     engine
-        .accrue_funding(engine.current_slot, 1_000_000, 50)
+        .accrue_funding_with_rate(engine.current_slot, 1_000_000, 50)
         .unwrap(); // 50 bps/slot
 
     // Settle funding
@@ -362,7 +362,7 @@ fn test_e2e_funding_complete_cycle() {
     // Advance time and accrue more funding (now Alice receives, Bob pays)
     engine.advance_slot(20);
     engine
-        .accrue_funding(engine.current_slot, 1_000_000, 50)
+        .accrue_funding_with_rate(engine.current_slot, 1_000_000, 50)
         .unwrap();
 
     engine.touch_account(alice).unwrap();

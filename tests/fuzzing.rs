@@ -554,7 +554,7 @@ impl FuzzState {
 
                 let result = self
                     .engine
-                    .accrue_funding(now_slot, *oracle_price, *rate_bps);
+                    .accrue_funding_with_rate(now_slot, *oracle_price, *rate_bps);
 
                 match result {
                     Ok(()) => {
@@ -912,7 +912,7 @@ proptest! {
         let slot_before = engine.last_funding_slot;
 
         // Accrue with same slot (dt=0)
-        let _ = engine.accrue_funding(slot_before, price, rate);
+        let _ = engine.accrue_funding_with_rate(slot_before, price, rate);
 
         prop_assert_eq!(engine.funding_index_qpb_e6, index_before,
                         "Funding index changed with dt=0");
@@ -1436,7 +1436,7 @@ fn conservation_uses_settled_pnl_regression() {
 
     // Accrue significant funding WITHOUT touching accounts
     // This creates a gap between account.pnl and settled_pnl
-    engine.accrue_funding(1000, 1_000_000, 500).unwrap();
+    engine.accrue_funding_with_rate(1000, 1_000_000, 500).unwrap();
 
     // Manually compute conservation using settled_pnl formula
     let global_index = engine.funding_index_qpb_e6.get();
@@ -1508,7 +1508,7 @@ fn harness_rollback_simulation_test() {
     engine.deposit(user_idx, 1000, 0).unwrap();
 
     // Accrue some funding to create state that could be mutated
-    engine.accrue_funding(100, 1_000_000, 100).unwrap();
+    engine.accrue_funding_with_rate(100, 1_000_000, 100).unwrap();
 
     // Capture complete state before failed operation (deep clone of RiskEngine)
     let before = (*engine).clone();

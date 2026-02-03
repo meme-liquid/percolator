@@ -1,6 +1,6 @@
-# Risk Engine Spec (Source of Truth) — v3 (IM for Risk-Increasing Trades)
+# Risk Engine Spec (Source of Truth) — v4 (Fee-Debt-as-Liability + Crank Warmup + Initial Margin + Funding Anti-Retroactivity)
 **Design:** **Protected Principal + Junior Profit Claims with Global Haircut Ratio**  
-**Status:** Implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)  
+**Status:** Implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)   (updated: fee debt is margin liability; crank advances warmup; risk-increasing trades use initial margin; funding accrual is anti-retroactive)
 **Scope:** Perpetual DEX risk engine for a single quote-token vault (e.g., Solana program-owned vault).  
 
 **Goal:** Achieve the same safety goals as the prior design (oracle manipulation resistance within a warmup window, principal protection, bounded insolvency handling, conservation, and liveness) with **no global ADL scans** and **no “recover stranded” function**, while preventing “PnL zombie” accounts from indefinitely poisoning the global haircut ratio.
@@ -78,6 +78,11 @@ The engine stores at least:
 Funding (if supported):
 - `F_global: i128`
 - `last_funding_slot: u64`
+
+Funding rate state (if funding rate depends on mutable engine state, e.g. LP inventory):
+- `funding_rate_bps_per_slot_last: i64` — the per-slot funding rate **used for the interval starting at `last_funding_slot`** (see §7.1).  
+  If funding rate is purely exogenous, this MAY be omitted and treated as an input parameter; otherwise it MUST be stored to prevent retroactive rate changes.
+
 
 **O(1) aggregates (MUST maintain):**
 - `C_tot: u128 = Σ C_i` over all used accounts.
@@ -237,15 +242,54 @@ This prevents a crank-driven conversion from “creating capital” that bypasse
 
 ## 7. Funding and variation margin (if perpetual trading supported)
 
-### 7.1 Funding index
+### 7.1 Funding index and anti-retroactivity rule
 The engine MAY implement a global funding index `F_global` and per-account snapshot `f_snap_i`.
 
-On funding accrual from `last_funding_slot` to `current_slot`, the engine updates `F_global` deterministically using a policy rate.
+Funding accrual updates `F_global` over time according to a per-slot funding rate `r_t` (in **basis points per slot**) and a price sample `P_t` (oracle price or policy price). A minimal discrete model is:
+
+- `ΔF = Σ (P_t * r_t / 10_000)` over slots, expressed in **quote per 1 base** and scaled by `1e6` consistently with `price`.
+
+**Anti-retroactivity (MUST):** If `r_t` is computed from mutable engine state (e.g., LP inventory imbalance, OI, utilization), then state at slot `t1` MUST NOT affect funding charged for slots `< t1`.  
+In particular, an adversary MUST NOT be able to delay a permissionless crank, change the state just before the crank, and cause the new rate to be applied retroactively to the entire elapsed period since `last_funding_slot`.
+
+This requirement is **independent** of any crank freshness policy.
+
+### 7.1.1 Event-segmented accrual (recommended O(1) implementation)
+The engine SHOULD implement funding as **piecewise-constant** between discrete **rate-change events** (any operation that can change the inputs to `r_t`, e.g., trades or forced closes that change LP net position).
+
+Maintain in global state:
+- `last_funding_slot: u64`
+- `funding_rate_bps_per_slot_last: i64` — the rate that was in effect starting at `last_funding_slot`.
+
+Define `accrue_funding_to(s)` (where `s = current_slot`) as:
+- `dt = s - last_funding_slot` (saturating)
+- `ΔF = price_sample(s) * funding_rate_bps_per_slot_last * dt / 10_000`
+- `F_global += ΔF`
+- `last_funding_slot = s`
+
+**Rate-change rule (MUST):** Before executing any operation at slot `s` that might change the funding-rate inputs, the engine MUST:
+1. Call `accrue_funding_to(s)` using the **stored** `funding_rate_bps_per_slot_last`.
+2. Apply the operation (which may change the rate inputs).
+3. Recompute the next per-slot rate `r_next` from the **post-operation** state and set:
+   - `funding_rate_bps_per_slot_last = r_next`.
+
+A permissionless crank that advances time but does not change the rate inputs MAY do step (1) only.  
+If it recomputes the rate, it MUST do so **after** accrual and store it only for the **next** interval.
+
+**Consequence:** Funding charged for an interval depends only on the rate stored at the interval start, not on end-of-interval state; therefore inventory manipulation cannot be applied retroactively.
+
+### 7.1.2 Bounded `dt` (overflow safety and bounded approximation error) (SHOULD)
+For overflow safety and to bound approximation error if price is sampled sparsely, the engine SHOULD cap a single accrual step size:
+
+- `dt ≤ MAX_FUNDING_DT` (policy parameter)
+
+If `dt > MAX_FUNDING_DT`, the engine SHOULD accrue in multiple sub-steps (each `≤ MAX_FUNDING_DT`) or return an error that forces a crank/sweep before further risk-changing operations.
 
 ### 7.2 Funding settlement per account
 On account touch, the engine MUST settle funding into realized PnL:
 - `ΔF = F_global - f_snap_i`
-- `funding_payment = pos_i * ΔF / 1e6` (rounding policy MUST be specified; recommended: round in a conservative direction that does not overpay from the vault)
+- `funding_payment = pos_i * ΔF / 1e6`  
+  (rounding policy MUST be specified; recommended: round in a conservative direction that does not overpay from the vault)
 - `set_pnl(i, PNL_i - funding_payment)` (sign per convention)
 - `f_snap_i = F_global`
 
@@ -257,7 +301,6 @@ To make positions fungible and keep PnL realized, the engine SHOULD implement ma
 
 Then margin checks can use `mark = 0` at that oracle.
 
----
 
 ## 8. Fees
 
@@ -321,7 +364,7 @@ Canonical settle routine used by all user ops.
 
 MUST perform, in this exact order:
 1. Set `current_slot = now_slot`.
-2. Settle funding into `PNL_i` (§7.2).
+2. If funding is supported: accrue the global funding index to `current_slot` per §7.1 (e.g., `accrue_funding_to(current_slot)`), then settle funding into `PNL_i` (§7.2).
 3. Settle mark-to-oracle into `PNL_i` and set `entry_i = oracle_price` (§7.3).
 4. Charge fees/maintenance due (§8.2) (may create/extend fee debt).
 5. Settle losses immediately (§6.1).
@@ -356,7 +399,7 @@ Effects:
 
 ### 10.4 `execute_trade(a, b, oracle_price, now_slot, size, exec_price)`
 Preconditions:
-- For any risk-increasing trade, freshness gating SHOULD be enforced.
+- For any **risk-increasing** trade (increases `|pos|` for either party), freshness gating SHOULD be enforced.
 - Bounds: `oracle_price`, `exec_price`, and `size` MUST satisfy §1.3.
 
 Procedure:
@@ -364,14 +407,15 @@ Procedure:
 2. `touch_account_full(b, oracle_price, now_slot)`
 3. Apply trade position deltas (ensuring bounds).
 4. Compute trade PnL (zero-sum before fees) and apply using `set_pnl`.
-5. Charge explicit trading fees to insurance (§8.1).
-6. Update warmup slopes for any account whose positive PnL increased (§5.4).
-7. Enforce post-trade margin using `Eq_mtm_net` at oracle:
+5. Charge explicit trading fees to insurance (Section 8.1).
+6. Update warmup slopes for any account whose positive PnL increased (Section 5.4).
+7. If funding is supported and the funding-rate inputs are affected by this trade (e.g., LP net inventory changes), the engine MUST update the stored funding-rate state for the **next** interval per §7.1.1 step (3) (rate-change rule).
+8. Enforce post-trade margin using `Eq_mtm_net` at oracle:
    - **Always:** `Eq_mtm_net > MM_req` (maintenance margin).
    - **If risk-increasing:** `Eq_mtm_net ≥ IM_req` (initial margin).
    A trade is risk-increasing for account `i` when `|new_pos_i| > |old_pos_i|`.
    This prevents opening positions at the liquidation boundary.
-8. Perform fee-debt sweep (§6.3) if any principal was created during settlement/conversion.
+9. Perform fee-debt sweep (§6.3) if any principal was created during settlement/conversion.
 
 ### 10.5 `keeper_crank(...)` (optional but strongly recommended)
 A crank MAY:
@@ -379,6 +423,10 @@ A crank MAY:
 - touch a bounded window of accounts to keep funding/mark/fees current
 - liquidate unhealthy accounts
 - garbage-collect dust accounts
+
+**Funding anti-retroactivity (MUST, if funding is enabled):**
+- `keeper_crank` MUST call `accrue_funding_to(now_slot)` using the stored `funding_rate_bps_per_slot_last` (see §7.1.1).
+- If `keeper_crank` recomputes the funding rate from current state (e.g., LP net position), it MUST do so **after** accrual and store the result only for the **next** interval; it MUST NOT apply that recomputed rate retroactively to the elapsed `dt`.
 
 **New, normative requirement to prevent zombie poisoning:**
 - `keeper_crank` MUST invoke warmup profit conversion (§6.2) and fee-debt sweep (§6.3) for each account it touches (or for a bounded budgeted subset per crank), using the account’s warmup schedule.  
@@ -417,7 +465,8 @@ An implementation MUST include tests that cover:
    - `h` recovers accordingly (no indefinite collapse),
    - fee debt reduces `Eq_mtm_net` and can make abandoned positions liquidatable.
 7. **Fee debt sweep:** ensure that if crank/user ops create principal via conversion, fee debt is paid down immediately (no fee bypass).
-8. **IM for risk-increasing trades:** confirm that opening a new position or increasing `|pos|` requires initial margin, while risk-reducing trades only require maintenance margin. Specifically, a trade that would leave `Eq_mtm_net` between MM and IM must be rejected if risk-increasing but allowed if risk-reducing.
+8. **Funding anti-retroactivity:** simulate a long `dt` where LP inventory (or other rate input) changes near the end; confirm funding charged over the earlier interval uses the pre-change rate (no retroactive application), and only the post-change interval uses the new rate.
+9. **IM for risk-increasing trades:** confirm that opening a new position or increasing `|pos|` requires initial margin, while risk-reducing trades only require maintenance margin. Specifically, a trade that would leave `Eq_mtm_net` between MM and IM must be rejected if risk-increasing but allowed if risk-reducing.
 
 ---
 
