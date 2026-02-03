@@ -4067,3 +4067,67 @@ fn test_position_flip_margin_check() {
         println!("New short position opened with ~5.5% margin instead of 10% initial margin");
     }
 }
+
+#[test]
+fn test_lp_position_flip_margin_check() {
+    // Similar to test_position_flip_margin_check but for LP side.
+    // When a user trade causes the LP to flip from +X to -X,
+    // the LP only needs maintenance margin for the new position
+    // because |new| == |old| is not considered "risk-increasing".
+    //
+    // This is the same vulnerability pattern as the user position flip.
+
+    let mut params = default_params();
+    params.maintenance_margin_bps = 500;  // 5%
+    params.initial_margin_bps = 1000;      // 10%
+    params.trading_fee_bps = 0;
+    params.warmup_period_slots = 0;
+    params.max_crank_staleness_slots = u64::MAX;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    let oracle_price = 100_000_000u64; // $100
+
+    // User needs enough capital to trade
+    engine.deposit(user_idx, 50_000_000, 0).unwrap();
+
+    // LP needs capital for initial position (will have 100M notional)
+    // Give LP 15M capital initially
+    engine.accounts[lp_idx as usize].capital = U128::new(15_000_000);
+    engine.vault += 15_000_000;
+    engine.c_tot = U128::new(15_000_000 + 50_000_000);
+
+    // User sells 1M units to LP, LP becomes long +1M
+    // LP position value = 1M * 100 = 100M notional
+    let size: i128 = -1_000_000; // User sells (goes short), LP buys (goes long)
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, size).unwrap();
+    assert_eq!(engine.accounts[lp_idx as usize].position_size.get(), 1_000_000);
+    assert_eq!(engine.accounts[user_idx as usize].position_size.get(), -1_000_000);
+
+    // Reduce LP capital to just above maintenance margin (5% of 100M = 5M)
+    // Set to 5.5M (above 5% maint, below 10% initial)
+    engine.accounts[lp_idx as usize].capital = U128::new(5_500_000);
+    engine.c_tot = U128::new(5_500_000 + 50_000_000);
+
+    // Now user buys 2M units, flipping LP from +1M to -1M
+    // LP: +1M -> +1M - 2M = -1M (position flip)
+    // |new| = 1M, |old| = 1M, so NOT risk-increasing per current logic
+    // Should only require maintenance margin (5% of 100M = 5M)
+    // LP has 5.5M > 5M, so passes even though it should require 10M initial margin
+    let flip_size: i128 = 2_000_000; // User buys
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, flip_size);
+
+    println!("LP flip trade result: {:?}", result);
+    println!("LP position after flip: {}", engine.accounts[lp_idx as usize].position_size.get());
+
+    // This assertion demonstrates the edge case -
+    // LP opened -1M short with only ~5% margin when a new position should require 10%
+    if result.is_ok() {
+        assert_eq!(engine.accounts[lp_idx as usize].position_size.get(), -1_000_000);
+        println!("LP EDGE CASE: Position flip from +1M to -1M succeeded with only maintenance margin");
+        println!("LP opened new short position with ~5.5% margin instead of 10% initial margin");
+    }
+}
