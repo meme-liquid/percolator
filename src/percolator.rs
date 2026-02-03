@@ -164,8 +164,6 @@ pub struct Account {
     /// Last slot when maintenance fees were settled for this account
     pub last_fee_slot: u64,
 
-    /// Padding to match on-chain Account size (248 bytes)
-    pub _padding: [u8; 8],
 }
 
 impl Account {
@@ -198,7 +196,6 @@ fn empty_account() -> Account {
         owner: [0; 32],
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
-        _padding: [0; 8],
     }
 }
 
@@ -400,12 +397,6 @@ pub struct RiskEngine {
     /// Freelist head (u16::MAX = none)
     pub free_head: u16,
 
-    /// Padding to align accounts with on-chain slab layout.
-    /// The original Account struct had `kind` at offset 0 and `account_id` at offset 8.
-    /// After reordering Account fields (account_id first), we need this padding
-    /// to maintain backward compatibility with existing on-chain data.
-    /// On-chain accounts are at engine offset 95256, not 95248.
-    pub _padding_accounts: [u8; 8],
 
     /// Freelist next pointers
     pub next_free: [u16; MAX_ACCOUNTS],
@@ -673,7 +664,6 @@ impl RiskEngine {
             num_used_accounts: 0,
             next_account_id: 0,
             free_head: 0,
-            _padding_accounts: [0; 8],
             next_free: [0; MAX_ACCOUNTS],
             accounts: [empty_account(); MAX_ACCOUNTS],
         };
@@ -938,7 +928,6 @@ impl RiskEngine {
             owner: [0; 32],
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
-            _padding: [0; 8],
         };
 
         // Maintain c_tot aggregate (account was created with capital = excess)
@@ -999,7 +988,6 @@ impl RiskEngine {
             owner: [0; 32],
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
-            _padding: [0; 8],
         };
 
         // Maintain c_tot aggregate (account was created with capital = excess)

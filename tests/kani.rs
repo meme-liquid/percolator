@@ -2036,7 +2036,6 @@ fn fast_account_equity_computes_correctly() {
         owner: [0; 32],
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
-        _padding: [0; 8],
     };
 
     let equity = engine.account_equity(&account);
