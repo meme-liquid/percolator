@@ -37,6 +37,23 @@ The engine MUST reject or saturate safely when inputs exceed the following conce
 - `|pos| ≤ MAX_POSITION_ABS` (implementation-defined; MUST avoid overflow).
 - Any multiply/divide MUST avoid wraparound; overflow MUST return an error (or use a documented fail-safe that is conservative for solvency, e.g., treat equity as 0 for margin checks).
 
+### 1.4 Symbol-to-Code Mapping
+
+| Spec Symbol | Code Field | Type |
+|-------------|------------|------|
+| `C_i` | `capital` | `U128` |
+| `PNL_i` | `pnl` | `I128` |
+| `R_i` | `reserved_pnl` | `u64` |
+| `w_start_i` | `warmup_started_at_slot` | `u64` |
+| `w_slope_i` | `warmup_slope_per_step` | `U128` |
+| `f_snap_i` | `funding_index` | `I128` |
+| `pos_i` | `position_size` | `I128` |
+| `entry_i` | `entry_price` | `u64` |
+| `I` | `insurance_fund.balance` | `U128` |
+| `V` | `vault` | `U128` |
+| `C_tot` | `c_tot` | `U128` |
+| `PNL_pos_tot` | `pnl_pos_tot` | `U128` |
+
 ---
 
 ## 2. State model
@@ -72,6 +89,7 @@ The engine stores at least:
 
 - `V: u128` — vault token balance (program-owned vault).
 - `I: u128` — insurance fund balance (a senior claim within `V`).
+  **Implementation note:** May be wrapped in a struct with telemetry fields (e.g., `fee_revenue`). For solvency math, only the balance is relevant.
 - `I_floor: u128` — insurance floor threshold (policy parameter; does not affect solvency math directly but may gate risk-increasing ops).
 - `current_slot: u64`
 
@@ -151,7 +169,7 @@ Implementation MAY set a global constant `MAX_ROUNDING_SLACK ≥ MAX_ACCOUNTS` a
 
 ## 4. Aggregate maintenance (MUST use helpers)
 
-### 4.1 Helper: set principal
+### 4.1 Helper: set_capital (set principal)
 When changing `C_i` from `old_C` to `new_C`, the engine MUST do:
 - `C_tot += (new_C - old_C)` (signed delta in u128-safe manner)
 
@@ -161,6 +179,12 @@ When changing `PNL_i` from `old` to `new`, the engine MUST:
 - `PNL_i = new`
 
 All code paths that modify PnL (trades, funding, mark settlement, fees, liquidation) MUST call `set_pnl`.
+
+### 4.3 Batch update exception (implementation)
+When performance requires simultaneous update of multiple accounts (e.g., trade execution), direct field assignment is permitted IF:
+1. All aggregate deltas are computed before any assignment.
+2. Aggregates are updated atomically after all field assignments.
+3. The code documents this exception with a comment referencing this section.
 
 ---
 
@@ -556,4 +580,15 @@ I += pay
 ---
 
 **End of spec (v2).**
+
+---
+
+## Change Checklist
+
+When modifying this spec, ensure:
+
+- [ ] Symbol mapping table updated (§1.4) if new fields added
+- [ ] Code changes identified in implementation
+- [ ] Tests updated to cover new/changed behavior
+- [ ] Kani proofs reviewed for affected invariants
 

@@ -1028,10 +1028,8 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
-        let account = &mut self.accounts[idx as usize];
-
         // Calculate elapsed time
-        let dt = now_slot.saturating_sub(account.last_fee_slot);
+        let dt = now_slot.saturating_sub(self.accounts[idx as usize].last_fee_slot);
         if dt == 0 {
             return Ok(0);
         }
@@ -1044,32 +1042,33 @@ impl RiskEngine {
             .saturating_mul(dt as u128);
 
         // Update last_fee_slot
-        account.last_fee_slot = now_slot;
+        self.accounts[idx as usize].last_fee_slot = now_slot;
 
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
-        account.fee_credits = account.fee_credits.saturating_sub(due as i128);
+        self.accounts[idx as usize].fee_credits =
+            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
 
-        // If fee_credits is negative, pay from capital
+        // If fee_credits is negative, pay from capital using set_capital helper (spec §4.1)
         let mut paid_from_capital = 0u128;
-        if account.fee_credits.is_negative() {
-            let owed = neg_i128_to_u128(account.fee_credits.get());
-            let pay = core::cmp::min(owed, account.capital.get());
+        if self.accounts[idx as usize].fee_credits.is_negative() {
+            let owed = neg_i128_to_u128(self.accounts[idx as usize].fee_credits.get());
+            let current_cap = self.accounts[idx as usize].capital.get();
+            let pay = core::cmp::min(owed, current_cap);
 
-            account.capital = account.capital.saturating_sub(pay);
+            // Use set_capital helper to maintain c_tot aggregate (spec §4.1)
+            self.set_capital(idx as usize, current_cap.saturating_sub(pay));
             self.insurance_fund.balance = self.insurance_fund.balance + pay;
             self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
-            // Maintain c_tot aggregate
-            self.c_tot = U128::new(self.c_tot.get().saturating_sub(pay));
 
             // Credit back what was paid
-            account.fee_credits = account.fee_credits.saturating_add(pay as i128);
+            self.accounts[idx as usize].fee_credits =
+                self.accounts[idx as usize].fee_credits.saturating_add(pay as i128);
             paid_from_capital = pay;
         }
 
         // Check maintenance margin if account has a position (MTM check)
-        if !account.position_size.is_zero() {
-            // Re-borrow immutably for margin check
+        if !self.accounts[idx as usize].position_size.is_zero() {
             let account_ref = &self.accounts[idx as usize];
             if !self.is_above_maintenance_margin_mtm(account_ref, oracle_price) {
                 return Err(RiskError::Undercollateralized);
@@ -1093,9 +1092,7 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
-        let account = &mut self.accounts[idx as usize];
-
-        let dt = now_slot.saturating_sub(account.last_fee_slot);
+        let dt = now_slot.saturating_sub(self.accounts[idx as usize].last_fee_slot);
         if dt == 0 {
             return Ok(0);
         }
@@ -1107,25 +1104,27 @@ impl RiskEngine {
             .saturating_mul(dt as u128);
 
         // Advance slot marker regardless
-        account.last_fee_slot = now_slot;
+        self.accounts[idx as usize].last_fee_slot = now_slot;
 
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
-        account.fee_credits = account.fee_credits.saturating_sub(due as i128);
+        self.accounts[idx as usize].fee_credits =
+            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
 
-        // If negative, pay what we can from capital (no margin check)
+        // If negative, pay what we can from capital using set_capital helper (spec §4.1)
         let mut paid_from_capital = 0u128;
-        if account.fee_credits.is_negative() {
-            let owed = neg_i128_to_u128(account.fee_credits.get());
-            let pay = core::cmp::min(owed, account.capital.get());
+        if self.accounts[idx as usize].fee_credits.is_negative() {
+            let owed = neg_i128_to_u128(self.accounts[idx as usize].fee_credits.get());
+            let current_cap = self.accounts[idx as usize].capital.get();
+            let pay = core::cmp::min(owed, current_cap);
 
-            account.capital = account.capital.saturating_sub(pay);
+            // Use set_capital helper to maintain c_tot aggregate (spec §4.1)
+            self.set_capital(idx as usize, current_cap.saturating_sub(pay));
             self.insurance_fund.balance = self.insurance_fund.balance + pay;
             self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
-            // Maintain c_tot aggregate
-            self.c_tot = U128::new(self.c_tot.get().saturating_sub(pay));
 
-            account.fee_credits = account.fee_credits.saturating_add(pay as i128);
+            self.accounts[idx as usize].fee_credits =
+                self.accounts[idx as usize].fee_credits.saturating_add(pay as i128);
             paid_from_capital = pay;
         }
 
@@ -1143,18 +1142,21 @@ impl RiskEngine {
     /// Pay down existing fee debt (negative fee_credits) using available capital.
     /// Does not advance last_fee_slot or charge new fees — just sweeps capital
     /// that became available (e.g. after warmup settlement) into insurance.
+    /// Uses set_capital helper to maintain c_tot aggregate (spec §4.1).
     fn pay_fee_debt_from_capital(&mut self, idx: u16) {
-        let a = &mut self.accounts[idx as usize];
-        if a.fee_credits.is_negative() && !a.capital.is_zero() {
-            let owed = neg_i128_to_u128(a.fee_credits.get());
-            let pay = core::cmp::min(owed, a.capital.get());
+        if self.accounts[idx as usize].fee_credits.is_negative()
+            && !self.accounts[idx as usize].capital.is_zero()
+        {
+            let owed = neg_i128_to_u128(self.accounts[idx as usize].fee_credits.get());
+            let current_cap = self.accounts[idx as usize].capital.get();
+            let pay = core::cmp::min(owed, current_cap);
             if pay > 0 {
-                a.capital = a.capital.saturating_sub(pay);
+                // Use set_capital helper to maintain c_tot aggregate (spec §4.1)
+                self.set_capital(idx as usize, current_cap.saturating_sub(pay));
                 self.insurance_fund.balance = self.insurance_fund.balance + pay;
                 self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
-                // Maintain c_tot aggregate
-                self.c_tot = U128::new(self.c_tot.get().saturating_sub(pay));
-                a.fee_credits = a.fee_credits.saturating_add(pay as i128);
+                self.accounts[idx as usize].fee_credits =
+                    self.accounts[idx as usize].fee_credits.saturating_add(pay as i128);
             }
         }
     }
@@ -2176,9 +2178,12 @@ impl RiskEngine {
         self.accrue_funding(now_slot, oracle_price)
     }
 
-    /// Settle funding for an account (lazy update)
-    fn settle_account_funding(account: &mut Account, global_funding_index: I128) -> Result<()> {
-        let delta_f = global_funding_index
+    /// Settle funding for an account (lazy update).
+    /// Uses set_pnl helper to maintain pnl_pos_tot aggregate (spec §4.2).
+    fn settle_account_funding(&mut self, idx: usize) -> Result<()> {
+        let global_fi = self.funding_index_qpb_e6;
+        let account = &self.accounts[idx];
+        let delta_f = global_fi
             .get()
             .checked_sub(account.funding_index.get())
             .ok_or(RiskError::Overflow)?;
@@ -2205,16 +2210,16 @@ impl RiskEngine {
             };
 
             // Longs pay when funding positive: pnl -= payment
-            account.pnl = I128::new(
-                account
-                    .pnl
-                    .get()
-                    .checked_sub(payment)
-                    .ok_or(RiskError::Overflow)?,
-            );
+            // Use set_pnl helper to maintain pnl_pos_tot aggregate (spec §4.2)
+            let new_pnl = self.accounts[idx]
+                .pnl
+                .get()
+                .checked_sub(payment)
+                .ok_or(RiskError::Overflow)?;
+            self.set_pnl(idx, new_pnl);
         }
 
-        account.funding_index = global_funding_index;
+        self.accounts[idx].funding_index = global_fi;
         Ok(())
     }
 
@@ -2224,20 +2229,7 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
-        let global_fi = self.funding_index_qpb_e6;
-        let old_pnl = self.accounts[idx as usize].pnl.get();
-        Self::settle_account_funding(&mut self.accounts[idx as usize], global_fi)?;
-        let new_pnl = self.accounts[idx as usize].pnl.get();
-        // Update pnl_pos_tot for funding settlement
-        let old_pos = if old_pnl > 0 { old_pnl as u128 } else { 0 };
-        let new_pos = if new_pnl > 0 { new_pnl as u128 } else { 0 };
-        self.pnl_pos_tot = U128::new(
-            self.pnl_pos_tot
-                .get()
-                .saturating_add(new_pos)
-                .saturating_sub(old_pos),
-        );
-        Ok(())
+        self.settle_account_funding(idx as usize)
     }
 
     /// Settle mark-to-market PnL to the current oracle price (variation margin).
@@ -3016,7 +3008,9 @@ impl RiskEngine {
         // Credit fee to user's fee_credits (active traders earn credits that offset maintenance)
         user.fee_credits = user.fee_credits.saturating_add(fee as i128);
 
-        // (old/new pnl_pos values computed above for projected haircut; reused here)
+        // §4.3 Batch update exception: Direct field assignment for performance.
+        // All aggregate deltas (old/new pnl_pos values) computed above before assignment;
+        // aggregates (c_tot, pnl_pos_tot) updated atomically below.
         user.pnl = I128::new(new_user_pnl);
         user.position_size = I128::new(new_user_position);
         user.entry_price = oracle_price;
@@ -3027,6 +3021,7 @@ impl RiskEngine {
         lp.position_size = I128::new(new_lp_position);
         lp.entry_price = oracle_price;
 
+        // §4.1, §4.2: Atomic aggregate maintenance after batch field assignments
         // Maintain c_tot: user capital decreased by fee
         self.c_tot = U128::new(self.c_tot.get().saturating_sub(fee));
 

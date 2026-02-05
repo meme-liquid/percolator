@@ -4294,3 +4294,281 @@ fn test_warmup_resets_when_mark_increases_pnl() {
         user_capital_after
     );
 }
+
+// ==============================================================================
+// SPEC SYNC TESTS (Phase 4 - Aggregate Maintenance Verification)
+// ==============================================================================
+
+/// Test that funding settlement correctly maintains pnl_pos_tot when PnL flips sign.
+/// Spec §4.2 requires all PnL modifications to use set_pnl helper.
+#[test]
+fn test_funding_settlement_maintains_pnl_pos_tot() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    // Setup: user deposits capital
+    engine.deposit(user_idx, 100_000, 0).unwrap();
+    engine.accounts[lp_idx as usize].capital = U128::new(1_000_000);
+    engine.vault += 1_000_000;
+
+    // User has a long position
+    engine.accounts[user_idx as usize].position_size = I128::new(1_000_000);
+    engine.accounts[user_idx as usize].entry_price = 100_000_000;
+
+    // LP has opposite short position
+    engine.accounts[lp_idx as usize].position_size = I128::new(-1_000_000);
+    engine.accounts[lp_idx as usize].entry_price = 100_000_000;
+
+    // Give user positive PnL that will flip to negative after funding
+    engine.accounts[user_idx as usize].pnl = I128::new(50_000);
+
+    // Zero warmup to avoid side effects
+    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
+    engine.accounts[lp_idx as usize].warmup_slope_per_step = U128::new(0);
+
+    // Recompute aggregates to ensure consistency
+    engine.recompute_aggregates();
+
+    // Verify initial pnl_pos_tot includes user's positive PnL
+    let pnl_pos_tot_before = engine.pnl_pos_tot.get();
+    assert_eq!(pnl_pos_tot_before, 50_000, "Initial pnl_pos_tot should be 50_000");
+
+    // Accrue large positive funding that will make user's PnL negative
+    // rate = 1000 bps/slot for 1 slot at price 100e6
+    // delta_F = 100e6 * 1000 * 1 / 10000 = 10,000,000
+    // User payment = 1M * 10,000,000 / 1e6 = 10,000,000
+    engine.current_slot = 1;
+    engine.accrue_funding_with_rate(1, 100_000_000, 1000).unwrap();
+
+    // Settle funding for user - this should flip their PnL from +50k to -9.95M
+    engine.touch_account(user_idx).unwrap();
+
+    // User's new PnL should be negative: 50_000 - 10_000_000 = -9_950_000
+    let user_pnl_after = engine.accounts[user_idx as usize].pnl.get();
+    assert!(user_pnl_after < 0, "User PnL should be negative after large funding payment");
+
+    // pnl_pos_tot should now be 0 (user's PnL flipped from positive to negative)
+    let pnl_pos_tot_after = engine.pnl_pos_tot.get();
+    assert_eq!(
+        pnl_pos_tot_after, 0,
+        "pnl_pos_tot should be 0 after user's PnL flipped negative (was {}, now {})",
+        pnl_pos_tot_before, pnl_pos_tot_after
+    );
+
+    // Settle LP funding - LP should receive payment, gaining positive PnL
+    engine.touch_account(lp_idx).unwrap();
+
+    // LP's PnL should now be positive: 0 + 10,000,000 = 10,000,000
+    let lp_pnl_after = engine.accounts[lp_idx as usize].pnl.get();
+    assert!(lp_pnl_after > 0, "LP PnL should be positive after receiving funding");
+
+    // pnl_pos_tot should now equal LP's positive PnL
+    let pnl_pos_tot_final = engine.pnl_pos_tot.get();
+    assert_eq!(
+        pnl_pos_tot_final, lp_pnl_after as u128,
+        "pnl_pos_tot should equal LP's positive PnL"
+    );
+
+    // Verify by recomputing from scratch
+    let mut expected_pnl_pos_tot = 0u128;
+    if engine.accounts[user_idx as usize].pnl.get() > 0 {
+        expected_pnl_pos_tot += engine.accounts[user_idx as usize].pnl.get() as u128;
+    }
+    if engine.accounts[lp_idx as usize].pnl.get() > 0 {
+        expected_pnl_pos_tot += engine.accounts[lp_idx as usize].pnl.get() as u128;
+    }
+    assert_eq!(
+        pnl_pos_tot_final, expected_pnl_pos_tot,
+        "pnl_pos_tot should match manual calculation"
+    );
+}
+
+/// Test that trade execution correctly maintains c_tot and pnl_pos_tot aggregates.
+/// Spec §4.1, §4.2, §4.3 require aggregate maintenance (batch exception documented).
+#[test]
+fn test_trade_aggregate_consistency() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+
+    // Setup accounts with known initial state
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    let user_capital = 100_000u128;
+    let lp_capital = 500_000u128;
+
+    engine.deposit(user_idx, user_capital, 0).unwrap();
+    engine.accounts[lp_idx as usize].capital = U128::new(lp_capital);
+    engine.vault += lp_capital;
+
+    // Recompute to ensure clean state
+    engine.recompute_aggregates();
+
+    // Record initial aggregates
+    let c_tot_before = engine.c_tot.get();
+    let pnl_pos_tot_before = engine.pnl_pos_tot.get();
+
+    assert_eq!(c_tot_before, user_capital + lp_capital, "Initial c_tot mismatch");
+    assert_eq!(pnl_pos_tot_before, 0, "Initial pnl_pos_tot should be 0");
+
+    // Execute a trade
+    let oracle_price = 1_000_000u64; // $1
+    let trade_size = 10_000i128;
+    engine
+        .execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle_price, trade_size)
+        .unwrap();
+
+    // Manually compute expected values:
+    // - Trading fee = ceil(notional * fee_bps / 10000) = ceil(10000 * 1 * 10 / 10000) = ceil(10) = 10
+    //   (notional = |size| * price / 1e6 = 10000 * 1000000 / 1000000 = 10000)
+    //   Actually fee = ceil(10000 * 10 / 10000) = ceil(10) = 10
+    // - Fee is deducted from user capital
+    // - c_tot should decrease by fee amount
+
+    let fee = 10u128; // ceil(10000 * 10 / 10000)
+    let expected_c_tot = c_tot_before - fee;
+
+    assert_eq!(
+        engine.c_tot.get(),
+        expected_c_tot,
+        "c_tot should decrease by trading fee: expected {}, got {}",
+        expected_c_tot,
+        engine.c_tot.get()
+    );
+
+    // Verify c_tot by summing all account capitals
+    let mut manual_c_tot = 0u128;
+    if engine.is_used(user_idx as usize) {
+        manual_c_tot += engine.accounts[user_idx as usize].capital.get();
+    }
+    if engine.is_used(lp_idx as usize) {
+        manual_c_tot += engine.accounts[lp_idx as usize].capital.get();
+    }
+    assert_eq!(
+        engine.c_tot.get(),
+        manual_c_tot,
+        "c_tot should match sum of account capitals"
+    );
+
+    // Verify pnl_pos_tot by summing positive PnLs
+    let mut manual_pnl_pos_tot = 0u128;
+    let user_pnl = engine.accounts[user_idx as usize].pnl.get();
+    let lp_pnl = engine.accounts[lp_idx as usize].pnl.get();
+    if user_pnl > 0 {
+        manual_pnl_pos_tot += user_pnl as u128;
+    }
+    if lp_pnl > 0 {
+        manual_pnl_pos_tot += lp_pnl as u128;
+    }
+    assert_eq!(
+        engine.pnl_pos_tot.get(),
+        manual_pnl_pos_tot,
+        "pnl_pos_tot should match sum of positive PnLs: expected {}, got {}",
+        manual_pnl_pos_tot,
+        engine.pnl_pos_tot.get()
+    );
+}
+
+/// Test rounding slack bound with multiple accounts having positive PnL.
+/// Spec §3.4: Residual - Σ PNL_eff_pos_i < K where K = count of positive PnL accounts.
+/// The bound ensures floor rounding in effective PnL calculation doesn't lose more than K units.
+#[test]
+fn test_rounding_bound_with_many_positive_pnl_accounts() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+
+    // Create multiple accounts with positive PnL
+    let num_accounts = 10usize;
+    let mut account_indices = Vec::new();
+
+    for _ in 0..num_accounts {
+        let idx = engine.add_user(0).unwrap();
+        engine.deposit(idx, 10_000, 0).unwrap();
+        account_indices.push(idx);
+    }
+
+    // Set each account to have different positive PnL values
+    // Use values that will create rounding when haircutted
+    for (i, &idx) in account_indices.iter().enumerate() {
+        let pnl = ((i + 1) * 1000 + 7) as i128; // 1007, 2007, 3007, ... (odd values for rounding)
+        engine.accounts[idx as usize].pnl = I128::new(pnl);
+    }
+
+    // Total positive PnL = 1007 + 2007 + ... + 10007 = 55070
+    let total_positive_pnl: u128 = (1..=num_accounts).map(|i| (i * 1000 + 7) as u128).sum();
+
+    // Set Residual to be LESS than total PnL to create a haircut (h < 1)
+    // This forces the floor operation to have rounding effects
+    // Residual = V - C_tot - I
+    // We want Residual < PNL_pos_tot
+    let target_residual = total_positive_pnl * 2 / 3; // ~66% backing → h ≈ 0.66
+
+    // c_tot = 10 * 10_000 = 100_000
+    let c_tot = engine.c_tot.get();
+    let insurance = engine.insurance_fund.balance.get();
+
+    // V = Residual + C_tot + I
+    engine.vault = U128::new(target_residual + c_tot + insurance);
+
+    engine.recompute_aggregates();
+
+    // Compute haircut ratio
+    let (h_num, h_den) = engine.haircut_ratio();
+
+    // Verify we have a haircut (h < 1)
+    assert!(
+        h_num < h_den,
+        "Test setup error: expected haircut (h_num={} < h_den={})",
+        h_num,
+        h_den
+    );
+
+    // Compute Residual
+    let residual = engine
+        .vault
+        .get()
+        .saturating_sub(engine.c_tot.get())
+        .saturating_sub(engine.insurance_fund.balance.get());
+
+    // h_num = min(Residual, PNL_pos_tot) = Residual (since Residual < PNL_pos_tot)
+    assert_eq!(h_num, residual, "h_num should equal Residual when underbacked");
+
+    // Compute sum of effective positive PnL using floor division
+    let mut sum_eff_pos_pnl = 0u128;
+    for &idx in &account_indices {
+        let pnl = engine.accounts[idx as usize].pnl.get();
+        if pnl > 0 {
+            // floor(pnl * h_num / h_den)
+            let eff_pos = (pnl as u128).saturating_mul(h_num) / h_den;
+            sum_eff_pos_pnl += eff_pos;
+        }
+    }
+
+    // Count accounts with positive PnL
+    let k = account_indices
+        .iter()
+        .filter(|&&idx| engine.accounts[idx as usize].pnl.get() > 0)
+        .count() as u128;
+
+    // Verify rounding slack bound: Residual - Σ PNL_eff_pos_i < K
+    // Since h_num = Residual, and each floor loses at most 1, we have:
+    // Residual - sum_eff_pos_pnl < K
+    let slack = residual.saturating_sub(sum_eff_pos_pnl);
+    assert!(
+        slack < k,
+        "Rounding slack bound violated: slack={} >= K={} (Residual={}, sum_eff_pos={}, h_num={}, h_den={})",
+        slack,
+        k,
+        residual,
+        sum_eff_pos_pnl,
+        h_num,
+        h_den
+    );
+
+    // Also verify it's within MAX_ROUNDING_SLACK
+    assert!(
+        slack <= MAX_ROUNDING_SLACK,
+        "Rounding slack {} exceeds MAX_ROUNDING_SLACK {}",
+        slack,
+        MAX_ROUNDING_SLACK
+    );
+}
