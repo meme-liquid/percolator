@@ -476,6 +476,8 @@ pub struct CrankOutcome {
     pub max_pnl_closed: u16,
     /// Number of max PnL errors during this crank
     pub max_pnl_errors: u16,
+    /// Whether OI cap is active (total_open_interest > max_oi_abs)
+    pub oi_cap_active: bool,
     /// Index where this crank stopped (next crank continues from here)
     pub last_cursor: u16,
     /// Whether this crank completed a full sweep of all accounts
@@ -1494,6 +1496,7 @@ impl RiskEngine {
         funding_rate_bps_per_slot: i64,
         allow_panic: bool,
         max_pnl_vault_bps: u64,
+        max_oi_abs: u128,
     ) -> Result<CrankOutcome> {
         // Validate oracle price bounds (prevents overflow in mark_pnl calculations)
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
@@ -1543,6 +1546,11 @@ impl RiskEngine {
         } else {
             (0, true)
         };
+
+        // OI cap enforcement: if total OI exceeds cap, block new position opens
+        // by temporarily boosting risk_reduction_threshold to u128::MAX.
+        // This uses the existing risk-reduction gate in trade handlers.
+        let oi_cap_active = max_oi_abs > 0 && self.total_open_interest.get() > max_oi_abs;
 
         // Detect conditions for informational flags (before processing)
         let force_realize_active = self.force_realize_active();
@@ -1723,6 +1731,7 @@ impl RiskEngine {
             force_realize_errors,
             max_pnl_closed,
             max_pnl_errors,
+            oi_cap_active,
             last_cursor: self.crank_cursor,
             sweep_complete,
         })

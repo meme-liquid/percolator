@@ -2224,7 +2224,7 @@ fn proof_keeper_crank_advances_slot_monotonically() {
     // Use deterministic slot advancement for non-vacuous proof
     let now_slot: u64 = 200; // Deterministic: always advances
 
-    let result = engine.keeper_crank(user, now_slot, 1_000_000, 0, false, 0);
+    let result = engine.keeper_crank(user, now_slot, 1_000_000, 0, false, 0, 0);
 
     // keeper_crank succeeds with valid setup
     assert!(
@@ -2279,7 +2279,7 @@ fn proof_keeper_crank_best_effort_settle() {
     sync_engine_aggregates(&mut engine);
 
     // Crank at a later slot - fees will exceed capital
-    let result = engine.keeper_crank(user, 100_000, 1_000_000, 0, false, 0);
+    let result = engine.keeper_crank(user, 100_000, 1_000_000, 0, false, 0, 0);
 
     // keeper_crank ALWAYS returns Ok (best-effort settle)
     assert!(result.is_ok(), "keeper_crank must always succeed");
@@ -2651,7 +2651,7 @@ fn proof_keeper_crank_forgives_half_slots() {
     // With fee_per_slot = 1, due = charged_dt
     let insurance_before = engine.insurance_fund.balance;
 
-    let result = engine.keeper_crank(user, now_slot, 1_000_000, 0, false, 0);
+    let result = engine.keeper_crank(user, now_slot, 1_000_000, 0, false, 0, 0);
 
     // keeper_crank always succeeds
     assert!(result.is_ok(), "keeper_crank should always succeed");
@@ -2707,7 +2707,7 @@ fn proof_net_extraction_bounded_with_fee_credits() {
     // Optional: attacker calls keeper_crank first (may fail, that's ok)
     let do_crank: bool = kani::any();
     let crank_ok = if do_crank {
-        engine.keeper_crank(attacker, 100, 1_000_000, 0, false, 0).is_ok()
+        engine.keeper_crank(attacker, 100, 1_000_000, 0, false, 0, 0).is_ok()
     } else {
         false
     };
@@ -3030,7 +3030,7 @@ fn proof_keeper_crank_best_effort_liquidation() {
     let now_slot: u64 = 1;
 
     // keeper_crank must always succeed regardless of liquidation outcomes
-    let result = engine.keeper_crank(user, now_slot, oracle_price, 0, false, 0);
+    let result = engine.keeper_crank(user, now_slot, oracle_price, 0, false, 0, 0);
 
     assert!(
         result.is_ok(),
@@ -3531,7 +3531,7 @@ fn crank_bounds_respected() {
 
     let cursor_before = engine.crank_cursor;
 
-    let result = engine.keeper_crank(user, now_slot, 1_000_000, 0, false, 0);
+    let result = engine.keeper_crank(user, now_slot, 1_000_000, 0, false, 0, 0);
     assert!(result.is_ok(), "keeper_crank should succeed");
 
     let outcome = result.unwrap();
@@ -4330,7 +4330,7 @@ fn proof_keeper_crank_preserves_inv() {
     let now_slot: u64 = kani::any();
     kani::assume(now_slot > engine.last_crank_slot && now_slot <= 200);
 
-    let result = engine.keeper_crank(caller, now_slot, 1_000_000, 0, false, 0);
+    let result = engine.keeper_crank(caller, now_slot, 1_000_000, 0, false, 0, 0);
 
     // INV only matters on Ok path (Solana tx aborts on Err, state discarded)
     if result.is_ok() {
@@ -4526,7 +4526,7 @@ fn proof_sequence_deposit_crank_withdraw() {
 
     // Step 2: Crank (force success)
     let _ = assert_ok!(
-        engine.keeper_crank(user, 100, 1_000_000, 0, false, 0),
+        engine.keeper_crank(user, 100, 1_000_000, 0, false, 0, 0),
         "crank must succeed"
     );
     kani::assert(canonical_inv(&engine), "INV after crank");
@@ -4635,7 +4635,7 @@ fn proof_crank_with_funding_preserves_inv() {
     let funding_rate: i64 = kani::any();
     kani::assume(funding_rate > -100 && funding_rate < 100);
 
-    let result = engine.keeper_crank(user, 100, 1_000_000, funding_rate, false, 0);
+    let result = engine.keeper_crank(user, 100, 1_000_000, funding_rate, false, 0, 0);
 
     // Non-vacuity: crank must succeed
     assert!(result.is_ok(), "non-vacuity: keeper_crank must succeed");
@@ -5814,7 +5814,7 @@ fn proof_gap1_crank_with_fees_preserves_inv() {
     let last_crank_before = engine.last_crank_slot;
 
     // Crank at a later slot
-    let result = engine.keeper_crank(user, 150, 1_000_000, 0, false, 0);
+    let result = engine.keeper_crank(user, 150, 1_000_000, 0, false, 0, 0);
 
     if result.is_ok() {
         kani::assert(canonical_inv(&engine), "INV must hold after crank with fees");
@@ -6050,7 +6050,7 @@ fn proof_gap3_conservation_crank_funding_positions() {
     kani::assume(oracle_2 >= 900_000 && oracle_2 <= 1_100_000);
     kani::assume(funding_rate > -50 && funding_rate < 50);
 
-    let result = engine.keeper_crank(user, 150, oracle_2, funding_rate, false, 0);
+    let result = engine.keeper_crank(user, 150, oracle_2, funding_rate, false, 0, 0);
 
     // Non-vacuity: crank must succeed
     assert_ok!(result, "crank must succeed");
@@ -6115,7 +6115,7 @@ fn proof_gap3_multi_step_lifecycle_conservation() {
     kani::assert(canonical_inv(&engine), "INV after open trade");
 
     // Step 3: Crank with funding at oracle_2
-    let crank = engine.keeper_crank(user, 50, oracle_2, funding_rate, false, 0);
+    let crank = engine.keeper_crank(user, 50, oracle_2, funding_rate, false, 0, 0);
     kani::assume(crank.is_ok());
     kani::assert(canonical_inv(&engine), "INV after crank");
 
