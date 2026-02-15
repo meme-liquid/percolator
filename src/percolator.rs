@@ -472,6 +472,10 @@ pub struct CrankOutcome {
     pub force_realize_closed: u16,
     /// Number of force-realize errors during this crank
     pub force_realize_errors: u16,
+    /// Number of positions force-closed due to max PnL cap
+    pub max_pnl_closed: u16,
+    /// Number of max PnL errors during this crank
+    pub max_pnl_errors: u16,
     /// Index where this crank stopped (next crank continues from here)
     pub last_cursor: u16,
     /// Whether this crank completed a full sweep of all accounts
@@ -1489,6 +1493,7 @@ impl RiskEngine {
         oracle_price: u64,
         funding_rate_bps_per_slot: i64,
         allow_panic: bool,
+        max_pnl_vault_bps: u64,
     ) -> Result<CrankOutcome> {
         // Validate oracle price bounds (prevents overflow in mark_pnl calculations)
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
@@ -1547,6 +1552,8 @@ impl RiskEngine {
         let mut num_liq_errors: u16 = 0;
         let mut force_realize_closed: u16 = 0;
         let mut force_realize_errors: u16 = 0;
+        let mut max_pnl_closed: u16 = 0;
+        let mut max_pnl_errors: u16 = 0;
         let mut sweep_complete = false;
         let mut accounts_processed: u16 = 0;
         let mut liq_budget = LIQ_BUDGET_PER_CRANK;
@@ -1629,6 +1636,45 @@ impl RiskEngine {
                     }
                 }
 
+                // === Max PnL cap check ===
+                // If max_pnl_vault_bps > 0 and position has unrealized profit
+                // exceeding the cap, force-close it to protect LP vault
+                if max_pnl_vault_bps > 0
+                    && !self.accounts[idx].position_size.is_zero()
+                    && !self.accounts[idx].is_lp()
+                {
+                    let pos = self.accounts[idx].position_size.get();
+                    let entry = self.accounts[idx].entry_price;
+                    let settled_pnl = self.accounts[idx].pnl.get();
+
+                    if let Ok(mark_pnl) = Self::mark_pnl_for_position(pos, entry, oracle_price) {
+                        let total_pnl = settled_pnl.saturating_add(mark_pnl);
+                        if total_pnl > 0 {
+                            // Max PnL = c_tot * max_pnl_vault_bps / 10_000
+                            let vault_capital = self.c_tot.get();
+                            let max_pnl = mul_u128(vault_capital, max_pnl_vault_bps as u128) / 10_000;
+                            if (total_pnl as u128) > max_pnl {
+                                // Force close this position
+                                if self
+                                    .touch_account_for_force_realize(idx as u16, now_slot, oracle_price)
+                                    .is_ok()
+                                {
+                                    if self.oracle_close_position_core(idx as u16, oracle_price).is_ok()
+                                    {
+                                        max_pnl_closed += 1;
+                                        self.lifetime_force_realize_closes =
+                                            self.lifetime_force_realize_closes.saturating_add(1);
+                                    } else {
+                                        max_pnl_errors += 1;
+                                    }
+                                } else {
+                                    max_pnl_errors += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // === LP max tracking ===
                 if self.accounts[idx].is_lp() {
                     let abs_pos = self.accounts[idx].position_size.unsigned_abs();
@@ -1675,6 +1721,8 @@ impl RiskEngine {
             num_gc_closed,
             force_realize_closed,
             force_realize_errors,
+            max_pnl_closed,
+            max_pnl_errors,
             last_cursor: self.crank_cursor,
             sweep_complete,
         })

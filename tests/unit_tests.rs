@@ -1915,7 +1915,7 @@ fn test_keeper_crank_liquidates_undercollateralized_user() {
     let _insurance_before = engine.insurance_fund.balance;
 
     // Call keeper_crank with oracle price 0.5 (500_000 in e6)
-    let result = engine.keeper_crank(user, 1, 500_000, 0, false);
+    let result = engine.keeper_crank(user, 1, 500_000, 0, false, 0);
     assert!(result.is_ok());
 
     let outcome = result.unwrap();
@@ -1937,7 +1937,7 @@ fn test_keeper_crank_liquidates_undercollateralized_user() {
     // Pending loss from liquidation is resolved after a full sweep
     // Run enough cranks to complete a full sweep
     for slot in 2..=17 {
-        engine.keeper_crank(user, slot, 500_000, 0, false).unwrap();
+        engine.keeper_crank(user, slot, 500_000, 0, false, 0).unwrap();
     }
 
     // Note: Insurance may decrease if liquidation creates unpaid losses
@@ -2261,7 +2261,7 @@ fn test_gc_fee_drained_dust() {
 
     // Advance time to drain fees (500 / 100 = 5 slots)
     // Crank will settle fees, drain capital to 0, then GC
-    let outcome = engine.keeper_crank(user, 10, 1_000_000, 0, false).unwrap();
+    let outcome = engine.keeper_crank(user, 10, 1_000_000, 0, false, 0).unwrap();
 
     assert!(
         !engine.is_used(user as usize),
@@ -2285,7 +2285,7 @@ fn test_gc_positive_pnl_never_collected() {
 
     // Crank should NOT GC this account
     let outcome = engine
-        .keeper_crank(u16::MAX, 100, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 100, 1_000_000, 0, false, 0)
         .unwrap();
 
     assert!(
@@ -2323,7 +2323,7 @@ fn test_gc_negative_pnl_socialized() {
 
     // First crank: GC writes off negative PnL and frees account
     let outcome = engine
-        .keeper_crank(u16::MAX, 100, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 100, 1_000_000, 0, false, 0)
         .unwrap();
 
     assert!(
@@ -2370,7 +2370,7 @@ fn test_gc_with_position_not_collected() {
 
     // Crank should NOT GC this account (has position)
     let outcome = engine
-        .keeper_crank(u16::MAX, 100, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 100, 1_000_000, 0, false, 0)
         .unwrap();
 
     assert!(
@@ -2459,14 +2459,14 @@ fn test_batched_adl_profit_exclusion() {
     // Run crank at oracle price 0.81 - liquidation adds profit to pending bucket
     let crank_oracle = 810_000;
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, crank_oracle, 0, false)
+        .keeper_crank(u16::MAX, 1, crank_oracle, 0, false, 0)
         .unwrap();
 
     // Run additional cranks until socialization completes
     // (socialization processes accounts per crank)
     for slot in 2..20 {
         engine
-            .keeper_crank(u16::MAX, slot, crank_oracle, 0, false)
+            .keeper_crank(u16::MAX, slot, crank_oracle, 0, false, 0)
             .unwrap();
     }
 
@@ -2537,7 +2537,7 @@ fn test_batched_adl_conservation_basic() {
 
     // Crank at same price (no mark pnl change)
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Verify conservation after
@@ -2614,7 +2614,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
 
     // Single crank should liquidate all underwater accounts via priority phase
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Verify conservation after
@@ -2659,7 +2659,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
     let mut slot = 2u64;
     while !engine.last_full_sweep_completed_slot > 0 && slot < 100 {
         let outcome = engine
-            .keeper_crank(u16::MAX, slot, 1_000_000, 0, false)
+            .keeper_crank(u16::MAX, slot, 1_000_000, 0, false, 0)
             .unwrap();
         if outcome.sweep_complete {
             break;
@@ -2727,7 +2727,7 @@ fn test_window_liquidation_many_accounts_few_liquidatable() {
 
     // Run crank - should select top-K efficiently
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Verify conservation after
@@ -2795,7 +2795,7 @@ fn test_window_liquidation_many_liquidatable() {
 
     // Run crank
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Verify conservation after
@@ -2856,7 +2856,7 @@ fn test_force_realize_step_closes_in_window_only() {
     // Run crank (cursor starts at 0)
     assert_eq!(engine.crank_cursor, 0);
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Force-realize should have run and closed positions
@@ -2915,7 +2915,7 @@ fn test_force_realize_step_inert_above_threshold() {
 
     // Run crank
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Force-realize should not be needed
@@ -2968,7 +2968,7 @@ fn test_crank_force_closes_dust_positions() {
 
     // Run crank
     let outcome = engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Force-realize mode should NOT be needed (insurance above threshold)
@@ -3031,7 +3031,7 @@ fn test_pending_finalize_liveness_insurance_covers() {
 
     // Run enough cranks to complete a full sweep
     for slot in 1..=16 {
-        let result = engine.keeper_crank(u16::MAX, slot, 1_000_000, 0, false);
+        let result = engine.keeper_crank(u16::MAX, slot, 1_000_000, 0, false, 0);
         assert!(result.is_ok());
     }
 
@@ -3085,7 +3085,7 @@ fn test_force_realize_updates_lp_aggregates() {
     let sum_abs_before = engine.lp_sum_abs;
 
     // Run crank - should close LP position via force-realize
-    let result = engine.keeper_crank(u16::MAX, 1, 1_000_000, 0, false);
+    let result = engine.keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0);
     assert!(result.is_ok());
 
     // LP position should be closed
@@ -3121,7 +3121,7 @@ fn test_withdrawals_blocked_during_pending_unblocked_after() {
 
     // Crank to establish baseline
     engine
-        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false)
+        .keeper_crank(u16::MAX, 1, 1_000_000, 0, false, 0)
         .unwrap();
 
     // Under haircut-ratio design, there is no pending_unpaid_loss mechanism.
@@ -3668,7 +3668,7 @@ fn test_idle_user_drains_and_gc_closes() {
 
     // Advance 1000 slots and crank — fee drains 1/slot * 1000 = 1000 >> 10 capital
     let outcome = engine
-        .keeper_crank(user_idx, 1001, ORACLE_100K, 0, false)
+        .keeper_crank(user_idx, 1001, ORACLE_100K, 0, false, 0)
         .unwrap();
 
     // Account should have been drained to 0 capital
@@ -3701,7 +3701,7 @@ fn test_dust_stale_funding_gc() {
 
     // Crank should snap funding and GC the dust account
     let outcome = engine
-        .keeper_crank(user_idx, 10, ORACLE_100K, 0, false)
+        .keeper_crank(user_idx, 10, ORACLE_100K, 0, false, 0)
         .unwrap();
 
     assert_eq!(outcome.num_gc_closed, 1, "expected GC to close stale-funding dust");
@@ -3726,7 +3726,7 @@ fn test_dust_negative_fee_credits_gc() {
 
     // Crank should GC this account — negative fee_credits doesn't block GC
     let outcome = engine
-        .keeper_crank(user_idx, 10, ORACLE_100K, 0, false)
+        .keeper_crank(user_idx, 10, ORACLE_100K, 0, false, 0)
         .unwrap();
 
     assert_eq!(outcome.num_gc_closed, 1, "expected GC to close account with negative fee_credits");
@@ -3752,7 +3752,7 @@ fn test_lp_never_gc() {
     // Crank many times — LP should never be GC'd
     for slot in 1..=10 {
         let outcome = engine
-            .keeper_crank(lp_idx, slot * 100, ORACLE_100K, 0, false)
+            .keeper_crank(lp_idx, slot * 100, ORACLE_100K, 0, false, 0)
             .unwrap();
         assert_eq!(outcome.num_gc_closed, 0, "LP must not be garbage collected (slot {})", slot * 100);
     }
@@ -3932,12 +3932,12 @@ fn test_abandoned_with_stale_last_fee_slot_eventually_closed() {
     // Don't call any user ops. Run crank at a slot far ahead.
     // First crank: drains the account via fee settlement
     let _ = engine
-        .keeper_crank(user_idx, 10_000, ORACLE_100K, 0, false)
+        .keeper_crank(user_idx, 10_000, ORACLE_100K, 0, false, 0)
         .unwrap();
 
     // Second crank: GC scan should pick up the dust
     let _outcome = engine
-        .keeper_crank(user_idx, 10_001, ORACLE_100K, 0, false)
+        .keeper_crank(user_idx, 10_001, ORACLE_100K, 0, false, 0)
         .unwrap();
 
     // The account must be closed by now (across both cranks)
