@@ -1658,9 +1658,9 @@ impl RiskEngine {
                     if let Ok(mark_pnl) = Self::mark_pnl_for_position(pos, entry, oracle_price) {
                         let total_pnl = settled_pnl.saturating_add(mark_pnl);
                         if total_pnl > 0 {
-                            // Max PnL = c_tot * max_pnl_vault_bps / 10_000
-                            let vault_capital = self.c_tot.get();
-                            let max_pnl = mul_u128(vault_capital, max_pnl_vault_bps as u128) / 10_000;
+                            // max_pnl_vault_bps is pre-computed absolute cap (by program wrapper)
+                            // Wrapper computes: lp_capital_total * bps / 10000
+                            let max_pnl = max_pnl_vault_bps as u128;
                             if (total_pnl as u128) > max_pnl {
                                 // Force close this position
                                 if self

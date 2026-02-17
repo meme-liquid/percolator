@@ -56,31 +56,27 @@ fn test_max_pnl_force_close_profitable_trader() {
     assert_eq!(pos_before, 5_000_000);
 
     // Price pumps +30% -> trader PnL = 5M * 0.3 / 1.0 = 1.5M units
-    // With max_pnl_vault_bps = 2000 (20%), cap = c_tot * 20%
-    // c_tot = 10M + 1M = 11M, cap = 11M * 20% = 2.2M
-    // PnL ~1.5M < 2.2M cap -> NOT force-closed yet
+    // Now max_pnl is absolute (pre-computed by wrapper as lp_capital * bps / 10000)
+    // LP capital = 10M, 20% of LP = 2M absolute cap
+    // PnL ~1.5M < 2M cap -> NOT force-closed yet
 
-    // Run crank with max_pnl = 20% of vault
+    // Run crank with max_pnl = 2M absolute (= LP 10M * 20%)
     let outcome = engine
-        .keeper_crank(u16::MAX, 10, ORACLE_1_3M, 0, false, 2000, 0)
+        .keeper_crank(u16::MAX, 10, ORACLE_1_3M, 0, false, 2_000_000, 0)
         .unwrap();
 
-    // PnL calculation: settled_pnl + mark_pnl
-    // After settle, check if position still open
     let pos_after = engine.accounts[user_idx as usize].position_size.get();
 
-    // At 30% pump, 5M pos: mark_pnl = 5M * (1.3 - 1.0) / 1.0 = 1.5M
-    // Cap = c_tot(~11M) * 2000/10000 = 2.2M
-    // 1.5M < 2.2M -> should NOT be closed
+    // 1.5M < 2M -> should NOT be closed
     assert_eq!(pos_after, 5_000_000, "Position should still be open (PnL below cap)");
     assert_eq!(outcome.max_pnl_closed, 0);
 
     println!("[Scenario 1a] PnL below cap: position kept open. max_pnl_closed={}", outcome.max_pnl_closed);
 
-    // Now set a tighter cap: 10% (1000 bps)
-    // Cap = 11M * 10% = 1.1M, PnL ~1.5M > 1.1M -> SHOULD force close
+    // Now set a tighter cap: 1M absolute (= LP 10M * 10%)
+    // PnL ~1.5M > 1M -> SHOULD force close
     let outcome2 = engine
-        .keeper_crank(u16::MAX, 20, ORACLE_1_3M, 0, false, 1000, 0)
+        .keeper_crank(u16::MAX, 20, ORACLE_1_3M, 0, false, 1_000_000, 0)
         .unwrap();
 
     let pos_after2 = engine.accounts[user_idx as usize].position_size.get();
@@ -108,7 +104,7 @@ fn test_max_pnl_does_not_close_lp() {
     // Price drops -> LP profits (LP is short)
     // LP PnL could exceed cap, but LP should NOT be force-closed
     let outcome = engine
-        .keeper_crank(u16::MAX, 10, ORACLE_800K, 0, false, 500, 0) // Very tight 5% cap
+        .keeper_crank(u16::MAX, 10, ORACLE_800K, 0, false, 500_000, 0) // LP 10M * 5% = 500K absolute cap
         .unwrap();
 
     let lp_pos = engine.accounts[lp_idx as usize].position_size.get();
@@ -174,7 +170,7 @@ fn test_max_pnl_selective_close_only_profitable() {
     // User A PnL: 8M * 0.3 = 2.4M (positive)
     // User B PnL: -3M * 0.3 = -0.9M (negative, no force close needed)
     let outcome = engine
-        .keeper_crank(u16::MAX, 20, ORACLE_1_3M, 0, false, 1000, 0) // 10% cap
+        .keeper_crank(u16::MAX, 20, ORACLE_1_3M, 0, false, 2_000_000, 0) // LP 20M * 10% = 2M absolute cap
         .unwrap();
 
     let pos_a = engine.accounts[user_a as usize].position_size.get();
@@ -225,7 +221,7 @@ fn test_vault_drain_protection_e2e() {
 
     // Run crank at pumped price with 20% cap
     let outcome = engine
-        .keeper_crank(u16::MAX, 100, 1_500_000, 0, false, 2000, 0)
+        .keeper_crank(u16::MAX, 100, 1_500_000, 0, false, 2_000_000, 0) // LP 10M * 20% = 2M absolute cap
         .unwrap();
 
     let trader_pos = engine.accounts[trader as usize].position_size.get();
@@ -298,7 +294,7 @@ fn test_progressive_pnl_growth_triggers_force_close() {
     for (i, &price) in prices.iter().enumerate() {
         let slot = (i as u64 + 1) * 10;
         let outcome = engine
-            .keeper_crank(u16::MAX, slot, price, 0, false, 1500, 0) // 15% cap
+            .keeper_crank(u16::MAX, slot, price, 0, false, 1_500_000, 0) // LP 10M * 15% = 1.5M absolute cap
             .unwrap();
 
         let pos = engine.accounts[trader as usize].position_size.get();
