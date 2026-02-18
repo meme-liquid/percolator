@@ -2875,6 +2875,10 @@ impl RiskEngine {
             0
         };
 
+        // Split fee: 50% to LP capital, 50% to insurance
+        let lp_fee = fee / 2;
+        let insurance_fee = fee.saturating_sub(lp_fee);
+
         // Access both accounts
         let (user, lp) = if user_idx < lp_idx {
             let (left, right) = self.accounts.split_at_mut(lp_idx as usize);
@@ -2935,6 +2939,9 @@ impl RiskEngine {
             .get()
             .checked_sub(fee)
             .ok_or(RiskError::InsufficientBalance)?;
+
+        // LP receives its fee share as capital increase
+        let new_lp_capital = lp.capital.get().saturating_add(lp_fee);
 
         // Compute projected pnl_pos_tot AFTER trade PnL for fresh haircut in margin checks.
         // Can't call self.haircut_ratio() due to split_at_mut borrow on accounts;
@@ -3020,7 +3027,7 @@ impl RiskEngine {
         // After settle_mark_to_oracle, entry_price = oracle_price, so mark_pnl = 0
         // Use initial margin if risk-increasing, maintenance margin otherwise
         if new_lp_position != 0 {
-            let lp_cap_i = u128_to_i128_clamped(lp.capital.get());
+            let lp_cap_i = u128_to_i128_clamped(new_lp_capital);
             let neg_pnl = core::cmp::min(new_lp_pnl, 0);
             let eff_pos = eff_pos_pnl_inline(new_lp_pnl);
             let lp_eq_i = lp_cap_i
@@ -3058,9 +3065,10 @@ impl RiskEngine {
         }
 
         // Commit all state changes
+        // Insurance gets its share of the fee, LP fee already accounted in new_lp_capital
         self.insurance_fund.fee_revenue =
-            U128::new(add_u128(self.insurance_fund.fee_revenue.get(), fee));
-        self.insurance_fund.balance = U128::new(add_u128(self.insurance_fund.balance.get(), fee));
+            U128::new(add_u128(self.insurance_fund.fee_revenue.get(), insurance_fee));
+        self.insurance_fund.balance = U128::new(add_u128(self.insurance_fund.balance.get(), insurance_fee));
 
         // Credit fee to user's fee_credits (active traders earn credits that offset maintenance)
         user.fee_credits = user.fee_credits.saturating_add(fee as i128);
@@ -3077,10 +3085,11 @@ impl RiskEngine {
         lp.pnl = I128::new(new_lp_pnl);
         lp.position_size = I128::new(new_lp_position);
         lp.entry_price = oracle_price;
+        lp.capital = U128::new(new_lp_capital); // LP receives fee share
 
         // §4.1, §4.2: Atomic aggregate maintenance after batch field assignments
-        // Maintain c_tot: user capital decreased by fee
-        self.c_tot = U128::new(self.c_tot.get().saturating_sub(fee));
+        // c_tot delta: user lost fee, LP gained lp_fee → net change = -(fee - lp_fee) = -insurance_fee
+        self.c_tot = U128::new(self.c_tot.get().saturating_sub(insurance_fee));
 
         // Maintain pnl_pos_tot aggregate
         self.pnl_pos_tot = U128::new(

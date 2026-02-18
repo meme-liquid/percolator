@@ -4426,12 +4426,13 @@ fn test_trade_aggregate_consistency() {
     // - c_tot should decrease by fee amount
 
     let fee = 10u128; // ceil(10000 * 10 / 10000)
-    let expected_c_tot = c_tot_before - fee;
+    let insurance_fee = fee - fee / 2; // LP gets half, insurance gets other half
+    let expected_c_tot = c_tot_before - insurance_fee;
 
     assert_eq!(
         engine.c_tot.get(),
         expected_c_tot,
-        "c_tot should decrease by trading fee: expected {}, got {}",
+        "c_tot should decrease by insurance fee (half of trading fee): expected {}, got {}",
         expected_c_tot,
         engine.c_tot.get()
     );
